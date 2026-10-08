@@ -26,16 +26,17 @@ sysinfo = "0.31"
 futures-util = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 
-# Optional Candle backend for Hugging Face models (Metal/CUDA/CPU)
-candle-core = { version = "0.8", optional = true }
-candle-transformers = { version = "0.8", optional = true }
-candle-nn = { version = "0.8", optional = true }
+# Candle backend for Hugging Face models (Metal/CUDA/CPU)
+candle-core = "0.8"
+candle-transformers = "0.8"
+candle-nn = "0.8"
+tokenizers = "0.21"
+hf-hub = "0.3"
 
 [features]
 default = []
-candle = ["dep:candle-core", "dep:candle-transformers", "dep:candle-nn"]
-metal = ["candle", "candle-core/metal"]
-cuda = ["candle", "candle-core/cuda"]
+metal = ["candle-core/metal"]
+cuda = ["candle-core/cuda"]
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json", "stream"] }

@@ -24,8 +24,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let prefix_cache = create_shared_prefix_cache(settings.block_size, 512);
     let telemetry = create_telemetry();
 
-    // Initialize backend (Mock by default, Candle on GPU/Metal)
-    let backend = Arc::new(MockBackend::new(&settings.model, 3));
+    // Initialize backend (Mock if requested, or Candle on Metal/CPU)
+    let backend: Arc<dyn mini_serve::backends::ModelBackend> = if settings.model == "mock" {
+        Arc::new(MockBackend::new(&settings.model, 3))
+    } else {
+        info!(
+            "Loading real Hugging Face model {} via Candle backend...",
+            settings.model
+        );
+        match mini_serve::backends::CandleBackend::load_hf(&settings.model, &settings.device) {
+            Ok(candle_backend) => Arc::new(candle_backend),
+            Err(e) => {
+                tracing::error!(
+                    "Failed to load Candle model: {}. Falling back to MockBackend.",
+                    e
+                );
+                Arc::new(MockBackend::new(&settings.model, 3))
+            }
+        }
+    };
 
     // Spawn multi-worker schedulers with shared memory weights and caches
     let mut worker_handles = Vec::with_capacity(settings.num_workers);
@@ -36,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             settings.max_waiting_requests,
             Arc::clone(&cache),
             Arc::clone(&prefix_cache),
-            Arc::clone(&backend) as Arc<dyn mini_serve::backends::ModelBackend>,
+            Arc::clone(&backend),
         ));
 
         // Start worker continuous batching loop
