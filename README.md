@@ -20,6 +20,19 @@ Inspired by production serving systems (vLLM, TGI, and Together AI), `mini-serve
 
 ---
 
+## Documentation 📚
+
+Comprehensive technical deep-dives are located in the [`docs/`](docs/) directory:
+
+- [**Getting Started**](docs/getting_started.md): Installation, compilation with Apple Metal / CUDA, CLI options, and tests.
+- [**System Architecture**](docs/architecture.md): Systems design, Tokio multi-threaded worker model, zero-copy memory sharing, and routing.
+- [**Continuous Batching & Paged KV-Cache**](docs/continuous_batching_and_kv_cache.md): Iteration-level scheduling, paged memory allocation, fragmentation telemetry, and prefix caching.
+- [**Model Backends & Hardware Architecture**](docs/backends_and_models.md): Candle Metal integration, custom Qwen 2.5 and Qwen 3 implementations, and CUDA roadmap.
+- [**API & Telemetry Reference**](docs/api_reference.md): OpenAI-compatible REST endpoints, SSE streaming protocol, and Prometheus metrics.
+- [**Benchmarks & Performance Analysis**](docs/benchmarks_and_performance.md): Scientific A/B benchmark methodology and Apple M4 results comparing Rust vs. Python.
+
+---
+
 ## Quickstart
 
 ### Prerequisites
