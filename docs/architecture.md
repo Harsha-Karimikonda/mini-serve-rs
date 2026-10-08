@@ -76,3 +76,4 @@ $$\text{Score} = (\text{queue\_depth} + \text{active\_sequences} + 1) \times \te
 | **Physical KV-Cache Blocks** | Flat block vector (`Vec<Block>`) | `Arc<Mutex<KVCache>>` (Fast spinlock/parking_lot) |
 | **Prefix Activation Cache** | LRU map of 16-token SHA-256 chunk hashes | `Arc<Mutex<PrefixCache>>` |
 | **Token Streaming** | Bounded asynchronous channel (`mpsc`) | Per-request pair (`Sender` in worker, `Receiver` in Axum) |
+

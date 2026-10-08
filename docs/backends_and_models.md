@@ -83,3 +83,4 @@ We replaced upstream custom ops with primitive tensor operations supported nativ
 To scale to multi-node cloud clusters with NVIDIA H100/A100 GPUs:
 1. **`cudarc` Low-Level Driver**: Rust bindings directly to the CUDA Driver and runtime API with zero C++ wrapper dependencies.
 2. **Serverless Modal Containerization**: Single static binary deployed onto serverless GPU nodes that scale down to zero when idle, taking advantage of Mini-Serve's sub-second cold start.
+

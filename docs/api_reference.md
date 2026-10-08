@@ -187,3 +187,4 @@ Mini-Serve compiles an embedded dark-mode HTML5/CSS3 control dashboard directly 
   - Prefix cache hit rate and token savings meter.
   - Multi-worker load status and queue backlog meters.
   - Interactive prompt testing playground with real-time token streaming.
+

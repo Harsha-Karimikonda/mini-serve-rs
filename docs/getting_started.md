@@ -109,3 +109,4 @@ cargo clippy --features metal --all-targets -- -D warnings
 # Verify formatting
 cargo fmt -- --check
 ```
+

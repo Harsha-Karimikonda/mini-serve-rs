@@ -14,7 +14,7 @@ This document presents empirical benchmark measurements comparing the **Rust Min
 - **Engines Evaluated**:
   - **Rust Mini-Serve (`v0.2.0`)**: Compiled release with native Apple Metal shaders via Candle (`candle-core 0.8.4`).
   - **Python Mini-Inference-Engine (`v0.1.0`)**: FastAPI + Uvicorn + PyTorch (`v2.14.1`) MPS backend with out-of-process gRPC worker.
-- **Benchmark Driver**: [`scripts/benchmark_real_model.py`](file:///Users/hkarimkonda/Documents/mini-serve-rs/scripts/benchmark_real_model.py).
+- **Benchmark Methodology**: Automated end-to-end benchmark harness streaming completions over HTTP/SSE with concurrent requests and process RSS monitoring.
 
 ---
 
@@ -66,3 +66,4 @@ This document presents empirical benchmark measurements comparing the **Rust Min
 ### C. Long-Context Prefill Scaling
 - **PyTorch MPS Advantage**: On long prompt sequences ($> 400$ tokens), PyTorch MPS leverages Apple's proprietary `MPSGraph` pre-compiled fused Scaled Dot-Product Attention (SDPA) kernels.
 - **Candle Metal Evolution**: Candle executes decomposed matrix multiplications. For multi-thousand token contexts, integrating a dedicated fused Metal SDPA shader (or deploying on NVIDIA CUDA with `cudarc`) will match or exceed PyTorch's prefill speeds.
+

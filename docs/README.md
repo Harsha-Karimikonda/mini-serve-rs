@@ -65,3 +65,4 @@ Welcome to the comprehensive technical documentation for **Mini-Serve** (`mini-s
 2. **Deterministic Memory Footprint:** Fixed-size paged physical KV-cache allocations protect the host OS against Out-Of-Memory crashes.
 3. **Hardware-Native Shaders:** Pure standard Candle tensor operations that map directly onto Apple Silicon Metal shaders or NVIDIA CUDA PTX kernels.
 4. **Resilient Serving:** Cooperative client cancellation drops dead connection processing within a single token iteration, preventing compute wastage.
+

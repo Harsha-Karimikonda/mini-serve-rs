@@ -91,3 +91,4 @@ if seq.sender.is_closed() {
 }
 ```
 Cancellation takes effect within a **single token iteration** (< 25 ms), instantly releasing physical KV blocks.
+
