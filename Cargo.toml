@@ -1,0 +1,43 @@
+[package]
+name = "mini-serve"
+version = "0.2.0"
+edition = "2021"
+description = "High-throughput, fault-tolerant LLM inference engine and continuous batching control plane in Rust"
+authors = ["Harsha Karimikonda <harshakarimikonda22@gmail.com>"]
+
+[dependencies]
+tokio = { version = "1.40", features = ["full"] }
+axum = { version = "0.7", features = ["macros", "tokio"] }
+tower = { version = "0.4", features = ["util"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "timeout"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+metrics = "0.23"
+metrics-exporter-prometheus = "0.15"
+sha2 = "0.10"
+hex = "0.4"
+uuid = { version = "1.10", features = ["v4", "serde"] }
+async-trait = "0.1"
+parking_lot = "0.12"
+clap = { version = "4.5", features = ["derive", "env"] }
+sysinfo = "0.31"
+futures-util = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
+
+# Optional Candle backend for Hugging Face models (Metal/CUDA/CPU)
+candle-core = { version = "0.8", optional = true }
+candle-transformers = { version = "0.8", optional = true }
+candle-nn = { version = "0.8", optional = true }
+
+[features]
+default = []
+candle = ["dep:candle-core", "dep:candle-transformers", "dep:candle-nn"]
+metal = ["candle", "candle-core/metal"]
+cuda = ["candle", "candle-core/cuda"]
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json", "stream"] }
+tokio-test = "0.4"
+http-body-util = "0.1"
