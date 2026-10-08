@@ -24,6 +24,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let prefix_cache = create_shared_prefix_cache(settings.block_size, 512);
     let telemetry = create_telemetry();
 
+    if let Some(ref token) = settings.hf_token {
+        std::env::set_var("HF_TOKEN", token);
+    }
+
     // Initialize backend (Mock if requested, or Candle on Metal/CPU)
     let backend: Arc<dyn mini_serve::backends::ModelBackend> = if settings.model == "mock" {
         Arc::new(MockBackend::new(&settings.model, 3))

@@ -36,6 +36,9 @@ pub struct Settings {
 
     #[arg(long, env = "MINI_LOG_LEVEL", default_value = "info")]
     pub log_level: String,
+
+    #[arg(long, env = "HF_TOKEN")]
+    pub hf_token: Option<String>,
 }
 
 use crate::core::constants::*;
@@ -53,6 +56,7 @@ impl Default for Settings {
             block_size: DEFAULT_BLOCK_SIZE,
             num_workers: 2,
             log_level: "info".to_string(),
+            hf_token: None,
         }
     }
 }

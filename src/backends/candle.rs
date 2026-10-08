@@ -60,7 +60,23 @@ impl CandleBackend {
             )
         } else {
             info!("Fetching model {} from Hugging Face hub...", model_id);
-            let api = hf_hub::api::sync::Api::new()
+            let token = std::env::var("HF_TOKEN")
+                .or_else(|_| std::env::var("hf_token"))
+                .or_else(|_| std::env::var("HUGGING_FACE_HUB_TOKEN"))
+                .ok();
+
+            let mut builder = hf_hub::api::sync::ApiBuilder::from_env();
+            if let Some(ref t) = token {
+                let mask_len = t.len().min(8);
+                info!(
+                    "Authenticated Hugging Face request with token ({}...)",
+                    &t[..mask_len]
+                );
+                builder = builder.with_token(Some(t.clone()));
+            }
+
+            let api = builder
+                .build()
                 .map_err(|e| EngineError::BackendError(format!("Failed to init HF API: {}", e)))?;
             let repo = api.model(model_id.to_string());
 
