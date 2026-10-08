@@ -11,7 +11,7 @@ use axum::{
 use futures_util::StreamExt;
 use serde_json::json;
 use std::convert::Infallible;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::api::dashboard::DASHBOARD_HTML;
@@ -21,7 +21,7 @@ use crate::core::errors::EngineError;
 use crate::core::types::*;
 use crate::routing::router::SharedRouter;
 use crate::scheduler::sequence::TokenEvent;
-use crate::telemetry::metrics::SharedTelemetry;
+use crate::telemetry::{log_request, SharedTelemetry};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -90,6 +90,7 @@ async fn completions_handler(
     State(state): State<AppState>,
     Json(req): Json<CompletionRequest>,
 ) -> Result<Response, EngineError> {
+    let t0 = Instant::now();
     state.telemetry.record_request();
 
     if req.prompt.is_empty() {
@@ -192,6 +193,14 @@ async fn completions_handler(
             usage: final_usage,
         };
 
+        log_request(
+            "POST",
+            "/v1/completions",
+            &response.id,
+            200,
+            (t0.elapsed().as_secs_f64() * 1000.0).round(),
+        );
+
         Ok(Json(response).into_response())
     }
 }
@@ -200,6 +209,7 @@ async fn chat_completions_handler(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, EngineError> {
+    let t0 = Instant::now();
     state.telemetry.record_request();
 
     if req.messages.is_empty() {
@@ -313,6 +323,14 @@ async fn chat_completions_handler(
             }],
             usage: final_usage,
         };
+
+        log_request(
+            "POST",
+            "/v1/chat/completions",
+            &response.id,
+            200,
+            (t0.elapsed().as_secs_f64() * 1000.0).round(),
+        );
 
         Ok(Json(response).into_response())
     }

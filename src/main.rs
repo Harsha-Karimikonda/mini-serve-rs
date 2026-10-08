@@ -36,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             settings.max_waiting_requests,
             Arc::clone(&cache),
             Arc::clone(&prefix_cache),
-            Arc::clone(&backend) as Arc<dyn mini_serve::backends::mock::ModelBackend>,
+            Arc::clone(&backend) as Arc<dyn mini_serve::backends::ModelBackend>,
         ));
 
         // Start worker continuous batching loop

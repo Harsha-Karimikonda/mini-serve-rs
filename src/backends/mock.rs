@@ -6,21 +6,7 @@ use tokio::time::sleep;
 use crate::core::errors::EngineError;
 use crate::scheduler::sequence::ActiveSequence;
 
-pub struct StepToken {
-    pub token_id: u32,
-    pub text: String,
-    pub is_eos: bool,
-}
-
-#[async_trait]
-pub trait ModelBackend: Send + Sync {
-    fn name(&self) -> &str;
-    async fn init_sequence(&self, prompt: &str) -> Result<Vec<u32>, EngineError>;
-    async fn step_batch(
-        &self,
-        sequences: &mut [ActiveSequence],
-    ) -> Result<Vec<StepToken>, EngineError>;
-}
+use crate::backends::traits::{ModelBackend, StepToken};
 
 pub struct MockBackend {
     name: String,

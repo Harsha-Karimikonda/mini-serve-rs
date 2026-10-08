@@ -38,17 +38,19 @@ pub struct Settings {
     pub log_level: String,
 }
 
+use crate::core::constants::*;
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            host: "0.0.0.0".to_string(),
-            port: 8000,
-            model: "mock".to_string(),
-            device: "auto".to_string(),
-            max_batch_size: 8,
-            max_waiting_requests: 256,
-            kv_cache_blocks: 1024,
-            block_size: 16,
+            host: DEFAULT_HOST.to_string(),
+            port: DEFAULT_PORT,
+            model: DEFAULT_MODEL.to_string(),
+            device: DEFAULT_DEVICE.to_string(),
+            max_batch_size: DEFAULT_MAX_BATCH_SIZE,
+            max_waiting_requests: DEFAULT_MAX_WAITING_REQUESTS,
+            kv_cache_blocks: DEFAULT_KV_CACHE_BLOCKS,
+            block_size: DEFAULT_BLOCK_SIZE,
             num_workers: 2,
             log_level: "info".to_string(),
         }

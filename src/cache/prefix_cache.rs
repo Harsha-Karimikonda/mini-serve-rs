@@ -2,8 +2,10 @@ use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 
-pub const DEFAULT_CHUNK_SIZE: usize = 16;
-pub const DEFAULT_MAX_CHUNKS: usize = 512;
+use crate::core::constants::{DEFAULT_BLOCK_SIZE, DEFAULT_PREFIX_CACHE_MAX_CHUNKS};
+
+pub const DEFAULT_CHUNK_SIZE: usize = DEFAULT_BLOCK_SIZE;
+pub const DEFAULT_MAX_CHUNKS: usize = DEFAULT_PREFIX_CACHE_MAX_CHUNKS;
 
 #[derive(Debug, Clone)]
 pub struct PrefixMatch {

@@ -1,0 +1,10 @@
+pub const DEFAULT_BLOCK_SIZE: usize = 16;
+pub const DEFAULT_KV_CACHE_BLOCKS: usize = 1024;
+pub const DEFAULT_MAX_BATCH_SIZE: usize = 8;
+pub const DEFAULT_MAX_WAITING_REQUESTS: usize = 256;
+pub const DEFAULT_PREFIX_CACHE_MAX_CHUNKS: usize = 512;
+pub const DEFAULT_MAX_TOKENS: usize = 128;
+pub const DEFAULT_PORT: u16 = 8000;
+pub const DEFAULT_HOST: &str = "0.0.0.0";
+pub const DEFAULT_MODEL: &str = "mock";
+pub const DEFAULT_DEVICE: &str = "auto";

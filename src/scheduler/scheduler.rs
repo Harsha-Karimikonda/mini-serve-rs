@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
 use tracing::{debug, info, warn};
 
-use crate::backends::mock::{ModelBackend, StepToken};
+use crate::backends::{ModelBackend, StepToken};
 use crate::cache::{SharedKVCache, SharedPrefixCache};
 use crate::core::errors::EngineError;
 use crate::core::types::{RequestId, SamplingParams};
