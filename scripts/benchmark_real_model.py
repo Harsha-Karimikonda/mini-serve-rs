@@ -12,10 +12,12 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+import argparse
 import httpx
 import psutil
 
-MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
+DEFAULT_MODEL_ID = "Qwen/Qwen3-0.6B"
+CURRENT_MODEL_ID = DEFAULT_MODEL_ID
 RUST_PORT = 8002
 PYTHON_PORT = 8001
 RUST_ROOT = Path("/Users/hkarimkonda/Documents/mini-serve-rs")
@@ -97,7 +99,7 @@ async def measure_streaming_generation(client: httpx.AsyncClient, base_url: str,
     generated_text = []
 
     payload = {
-        "model": MODEL_ID,
+        "model": CURRENT_MODEL_ID,
         "prompt": prompt,
         "max_tokens": max_tokens,
         "stream": True,
@@ -142,7 +144,7 @@ async def measure_pure_ttft(client: httpx.AsyncClient, base_url: str, prompt: st
     """Measure exact Time-To-First-Token by requesting max_tokens=1."""
     t0 = time.perf_counter()
     payload = {
-        "model": MODEL_ID,
+        "model": CURRENT_MODEL_ID,
         "prompt": prompt,
         "max_tokens": 1,
         "stream": False,
@@ -245,22 +247,24 @@ async def benchmark_engine(name: str, base_url: str, proc: subprocess.Popen):
     }
 
 
-async def main():
+async def main(model_id: str = DEFAULT_MODEL_ID):
+    global CURRENT_MODEL_ID
+    CURRENT_MODEL_ID = model_id
     print("=" * 65)
     print("SCIENTIFIC REAL-MODEL A/B BENCHMARK ON APPLE SILICON M4")
-    print(f"Model: {MODEL_ID}")
+    print(f"Model: {model_id}")
     print("=" * 65)
 
     # ----------------------------------------------------
     # PHASE 1: RUST MINI-SERVE (Candle Metal)
     # ----------------------------------------------------
-    print("\n>>> Starting Rust Mini-Serve on port 8002...")
+    print(f"\n>>> Starting Rust Mini-Serve for {model_id} on port {RUST_PORT}...")
     t0_rust = time.perf_counter()
     rust_proc = subprocess.Popen(
         [
             str(RUST_ROOT / "target/release/mini-serve"),
             "--port", str(RUST_PORT),
-            "--model", MODEL_ID,
+            "--model", model_id,
             "--device", "metal",
             "--num-workers", "1",
         ],
@@ -291,9 +295,9 @@ async def main():
     # ----------------------------------------------------
     # PHASE 2: PYTHON MINI-INFERENCE-ENGINE (PyTorch MPS)
     # ----------------------------------------------------
-    print("\n>>> Starting Python Mini-Inference-Engine on port 8001...")
+    print(f"\n>>> Starting Python Mini-Inference-Engine for {model_id} on port {PYTHON_PORT}...")
     py_env = os.environ.copy()
-    py_env["MINI_MODEL"] = MODEL_ID
+    py_env["MINI_MODEL"] = model_id
     py_env["MINI_DEVICE"] = "mps"
     py_env["MINI_AUTOSCALE_ENABLED"] = "false"
     py_env["MINI_WORKER_COUNT"] = "1"
@@ -388,4 +392,12 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(description="Scientific real-model A/B benchmark")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=DEFAULT_MODEL_ID,
+        help=f"Model ID or path (default: {DEFAULT_MODEL_ID})",
+    )
+    args = parser.parse_args()
+    asyncio.run(main(args.model))

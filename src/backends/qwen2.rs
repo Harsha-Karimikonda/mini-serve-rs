@@ -15,13 +15,42 @@ pub struct Config {
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
     pub max_position_embeddings: usize,
-    pub sliding_window: usize,
-    pub max_window_layers: usize,
+    #[serde(default)]
+    pub sliding_window: Option<usize>,
+    #[serde(default)]
+    pub max_window_layers: Option<usize>,
+    #[serde(default = "default_tie_word_embeddings")]
     pub tie_word_embeddings: bool,
+    #[serde(default = "default_rope_theta")]
     pub rope_theta: f64,
+    #[serde(default = "default_rms_norm_eps")]
     pub rms_norm_eps: f64,
+    #[serde(default)]
     pub use_sliding_window: bool,
     pub hidden_act: Activation,
+    #[serde(default)]
+    pub head_dim: Option<usize>,
+    #[serde(default)]
+    pub attention_bias: Option<bool>,
+}
+
+fn default_tie_word_embeddings() -> bool {
+    true
+}
+
+fn default_rope_theta() -> f64 {
+    1000000.0
+}
+
+fn default_rms_norm_eps() -> f64 {
+    1e-6
+}
+
+impl Config {
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+            .unwrap_or(self.hidden_size / self.num_attention_heads)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -60,7 +89,7 @@ struct RotaryEmbedding {
 
 impl RotaryEmbedding {
     fn new(dtype: DType, cfg: &Config, dev: &Device) -> Result<Self> {
-        let dim = cfg.hidden_size / cfg.num_attention_heads;
+        let dim = cfg.head_dim();
         let max_seq_len = cfg.max_position_embeddings;
         let inv_freq: Vec<_> = (0..dim)
             .step_by(2)
@@ -151,11 +180,12 @@ struct Attention {
     k_proj: Linear,
     v_proj: Linear,
     o_proj: Linear,
+    q_norm: Option<RmsNorm>,
+    k_norm: Option<RmsNorm>,
     num_heads: usize,
     num_kv_heads: usize,
     num_kv_groups: usize,
     head_dim: usize,
-    hidden_size: usize,
     rotary_emb: Arc<RotaryEmbedding>,
     kv_cache: Option<(Tensor, Tensor)>,
 }
@@ -166,21 +196,50 @@ impl Attention {
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
         let num_kv_groups = num_heads / num_kv_heads;
-        let head_dim = hidden_sz / num_heads;
-        let q_proj = linear(hidden_sz, num_heads * head_dim, vb.pp("q_proj"))?;
-        let k_proj = linear(hidden_sz, num_kv_heads * head_dim, vb.pp("k_proj"))?;
-        let v_proj = linear(hidden_sz, num_kv_heads * head_dim, vb.pp("v_proj"))?;
+        let head_dim = cfg.head_dim();
+
+        let has_bias =
+            vb.pp("q_proj").contains_tensor("bias") || cfg.attention_bias.unwrap_or(false);
+
+        let q_proj = if has_bias {
+            linear(hidden_sz, num_heads * head_dim, vb.pp("q_proj"))?
+        } else {
+            linear_no_bias(hidden_sz, num_heads * head_dim, vb.pp("q_proj"))?
+        };
+        let k_proj = if has_bias {
+            linear(hidden_sz, num_kv_heads * head_dim, vb.pp("k_proj"))?
+        } else {
+            linear_no_bias(hidden_sz, num_kv_heads * head_dim, vb.pp("k_proj"))?
+        };
+        let v_proj = if has_bias {
+            linear(hidden_sz, num_kv_heads * head_dim, vb.pp("v_proj"))?
+        } else {
+            linear_no_bias(hidden_sz, num_kv_heads * head_dim, vb.pp("v_proj"))?
+        };
         let o_proj = linear_no_bias(num_heads * head_dim, hidden_sz, vb.pp("o_proj"))?;
+
+        let q_norm = if vb.pp("q_norm").contains_tensor("weight") {
+            Some(RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?)
+        } else {
+            None
+        };
+        let k_norm = if vb.pp("k_norm").contains_tensor("weight") {
+            Some(RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?)
+        } else {
+            None
+        };
+
         Ok(Self {
             q_proj,
             k_proj,
             v_proj,
             o_proj,
+            q_norm,
+            k_norm,
             num_heads,
             num_kv_heads,
             num_kv_groups,
             head_dim,
-            hidden_size: hidden_sz,
             rotary_emb,
             kv_cache: None,
         })
@@ -198,15 +257,23 @@ impl Attention {
         let key_states = self.k_proj.forward(xs)?;
         let value_states = self.v_proj.forward(xs)?;
 
-        let query_states = query_states
-            .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let key_states = key_states
-            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
+        let query_states = query_states.reshape((b_sz, q_len, self.num_heads, self.head_dim))?;
+        let key_states = key_states.reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?;
         let value_states = value_states
             .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
+
+        let query_states = match &self.q_norm {
+            Some(norm) => norm.forward(&query_states)?,
+            None => query_states,
+        };
+        let key_states = match &self.k_norm {
+            Some(norm) => norm.forward(&key_states)?,
+            None => key_states,
+        };
+
+        let query_states = query_states.transpose(1, 2)?;
+        let key_states = key_states.transpose(1, 2)?;
 
         let (query_states, key_states) =
             self.rotary_emb
@@ -238,7 +305,7 @@ impl Attention {
         };
         attn_output
             .transpose(1, 2)?
-            .reshape((b_sz, q_len, self.hidden_size))?
+            .reshape((b_sz, q_len, self.num_heads * self.head_dim))?
             .apply(&self.o_proj)
     }
 
@@ -300,7 +367,7 @@ pub struct Model {
     embed_tokens: candle_nn::Embedding,
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
-    sliding_window: usize,
+    sliding_window: Option<usize>,
     device: Device,
     dtype: DType,
 }
@@ -334,10 +401,11 @@ impl Model {
         tgt_len: usize,
         seqlen_offset: usize,
     ) -> Result<Tensor> {
+        let sliding_window = self.sliding_window;
         let mask: Vec<_> = (0..tgt_len)
             .flat_map(|i| {
                 (0..tgt_len).map(move |j| {
-                    if i < j || j + self.sliding_window < i {
+                    if i < j || sliding_window.is_some_and(|w| j + w < i) {
                         f32::NEG_INFINITY
                     } else {
                         0.
