@@ -75,4 +75,3 @@ async fn test_qwen3_load_and_generate() {
         full_text
     );
 }
-

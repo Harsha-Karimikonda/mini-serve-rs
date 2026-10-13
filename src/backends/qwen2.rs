@@ -82,9 +82,9 @@ impl Module for RmsNorm {
 }
 
 #[derive(Debug, Clone)]
-struct RotaryEmbedding {
-    sin: Tensor,
-    cos: Tensor,
+pub struct RotaryEmbedding {
+    pub sin: Tensor,
+    pub cos: Tensor,
 }
 
 impl RotaryEmbedding {
@@ -143,7 +143,7 @@ fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
 
 #[derive(Debug, Clone)]
 #[allow(clippy::upper_case_acronyms)]
-struct MLP {
+pub struct MLP {
     gate_proj: Linear,
     up_proj: Linear,
     down_proj: Linear,
@@ -175,19 +175,20 @@ impl Module for MLP {
 }
 
 #[derive(Debug, Clone)]
-struct Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
-    q_norm: Option<RmsNorm>,
-    k_norm: Option<RmsNorm>,
-    num_heads: usize,
-    num_kv_heads: usize,
-    num_kv_groups: usize,
-    head_dim: usize,
-    rotary_emb: Arc<RotaryEmbedding>,
-    kv_cache: Option<(Tensor, Tensor)>,
+pub struct Attention {
+    pub q_proj: Linear,
+    pub k_proj: Linear,
+    pub v_proj: Linear,
+    pub o_proj: Linear,
+    pub q_norm: Option<RmsNorm>,
+    pub k_norm: Option<RmsNorm>,
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub num_kv_groups: usize,
+    pub head_dim: usize,
+    pub rotary_emb: Arc<RotaryEmbedding>,
+    pub max_seq_len: usize,
+    pub kv_cache: Option<candle_nn::kv_cache::KvCache>,
 }
 
 impl Attention {
@@ -197,6 +198,7 @@ impl Attention {
         let num_kv_heads = cfg.num_key_value_heads;
         let num_kv_groups = num_heads / num_kv_heads;
         let head_dim = cfg.head_dim();
+        let max_seq_len = cfg.max_position_embeddings.max(4096);
 
         let has_bias =
             vb.pp("q_proj").contains_tensor("bias") || cfg.attention_bias.unwrap_or(false);
@@ -241,6 +243,7 @@ impl Attention {
             num_kv_groups,
             head_dim,
             rotary_emb,
+            max_seq_len,
             kv_cache: None,
         })
     }
@@ -279,15 +282,7 @@ impl Attention {
             self.rotary_emb
                 .apply_rotary_emb_qkv(&query_states, &key_states, seqlen_offset)?;
 
-        let (key_states, value_states) = match &self.kv_cache {
-            None => (key_states, value_states),
-            Some((prev_k, prev_v)) => {
-                let key_states = Tensor::cat(&[prev_k, &key_states], 2)?;
-                let value_states = Tensor::cat(&[prev_v, &value_states], 2)?;
-                (key_states, value_states)
-            }
-        };
-        self.kv_cache = Some((key_states.clone(), value_states.clone()));
+        let (key_states, value_states) = self.append_kv(&key_states, &value_states)?;
 
         let key_states = repeat_kv(key_states, self.num_kv_groups)?.contiguous()?;
         let value_states = repeat_kv(value_states, self.num_kv_groups)?.contiguous()?;
@@ -309,17 +304,34 @@ impl Attention {
             .apply(&self.o_proj)
     }
 
+    pub fn append_kv(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
+        let k = k.contiguous()?;
+        let v = v.contiguous()?;
+        match &mut self.kv_cache {
+            None => {
+                let mut cache = candle_nn::kv_cache::KvCache::new(2, self.max_seq_len);
+                let res = cache.append(&k, &v)?;
+                self.kv_cache = Some(cache);
+                Ok(res)
+            }
+            Some(cache) => cache.append(&k, &v),
+        }
+    }
+
     fn clear_kv_cache(&mut self) {
+        if let Some(cache) = &mut self.kv_cache {
+            cache.reset();
+        }
         self.kv_cache = None;
     }
 }
 
 #[derive(Debug, Clone)]
-struct DecoderLayer {
-    self_attn: Attention,
-    mlp: MLP,
-    input_layernorm: RmsNorm,
-    post_attention_layernorm: RmsNorm,
+pub struct DecoderLayer {
+    pub self_attn: Attention,
+    pub mlp: MLP,
+    pub input_layernorm: RmsNorm,
+    pub post_attention_layernorm: RmsNorm,
 }
 
 impl DecoderLayer {
@@ -364,12 +376,12 @@ impl DecoderLayer {
 
 #[derive(Debug, Clone)]
 pub struct Model {
-    embed_tokens: candle_nn::Embedding,
-    layers: Vec<DecoderLayer>,
-    norm: RmsNorm,
-    sliding_window: Option<usize>,
-    device: Device,
-    dtype: DType,
+    pub embed_tokens: candle_nn::Embedding,
+    pub layers: Vec<DecoderLayer>,
+    pub norm: RmsNorm,
+    pub sliding_window: Option<usize>,
+    pub device: Device,
+    pub dtype: DType,
 }
 
 impl Model {
@@ -471,8 +483,8 @@ impl Model {
 
 #[derive(Debug, Clone)]
 pub struct ModelForCausalLM {
-    base_model: Model,
-    lm_head: Linear,
+    pub base_model: Model,
+    pub lm_head: Linear,
 }
 
 impl ModelForCausalLM {
@@ -497,7 +509,186 @@ impl ModelForCausalLM {
             .apply(&self.lm_head)
     }
 
+    /// Single batched forward pass for concurrent sequence decode steps.
+    /// Runs all heavy weight projections (MLP, QKV, LM Head) batched on the GPU.
+    pub fn step_decode_batch(
+        models: &mut [&mut Self],
+        input_ids: &[u32],
+        positions: &[usize],
+        device: &Device,
+    ) -> Result<Vec<u32>> {
+        let b_sz = models.len();
+        if b_sz == 0 {
+            return Ok(Vec::new());
+        }
+        if b_sz == 1 {
+            let input_tensor = Tensor::new(&[input_ids[0]], device)?.unsqueeze(0)?;
+            let logits = models[0].forward(&input_tensor, positions[0])?;
+            let last_logits = logits.squeeze(0)?.squeeze(0)?;
+            let next_token_id = last_logits.argmax(0)?.to_scalar::<u32>()?;
+            return Ok(vec![next_token_id]);
+        }
+
+        // 1. Batched Token Embeddings: [b_sz, 1] -> [b_sz, 1, hidden_size]
+        let input_tensor = Tensor::new(input_ids, device)?.reshape((b_sz, 1))?;
+        let mut xs = models[0].base_model.embed_tokens.forward(&input_tensor)?;
+
+        // Convert positions to Tensor for batched RoPE index_select on Metal
+        let pos_u32: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
+        let pos_tensor = Tensor::new(pos_u32.as_slice(), device)?;
+
+        let num_heads = models[0].base_model.layers[0].self_attn.num_heads;
+        let num_kv_heads = models[0].base_model.layers[0].self_attn.num_kv_heads;
+        let num_kv_groups = models[0].base_model.layers[0].self_attn.num_kv_groups;
+        let head_dim = models[0].base_model.layers[0].self_attn.head_dim;
+        let scale = 1f64 / f64::sqrt(head_dim as f64);
+
+        for l in 0..models[0].base_model.layers.len() {
+            let residual = xs.clone();
+            let norm_xs = models[0].base_model.layers[l]
+                .input_layernorm
+                .forward(&xs)?;
+
+            // Batched Q, K, V Projections across all sequences
+            let q = models[0].base_model.layers[l]
+                .self_attn
+                .q_proj
+                .forward(&norm_xs)?;
+            let k = models[0].base_model.layers[l]
+                .self_attn
+                .k_proj
+                .forward(&norm_xs)?;
+            let v = models[0].base_model.layers[l]
+                .self_attn
+                .v_proj
+                .forward(&norm_xs)?;
+
+            let q = q.reshape((b_sz, 1, num_heads, head_dim))?;
+            let k = k.reshape((b_sz, 1, num_kv_heads, head_dim))?;
+            let v = v
+                .reshape((b_sz, 1, num_kv_heads, head_dim))?
+                .transpose(1, 2)?;
+
+            let q = match &models[0].base_model.layers[l].self_attn.q_norm {
+                Some(norm) => norm.forward(&q)?,
+                None => q,
+            };
+            let k = match &models[0].base_model.layers[l].self_attn.k_norm {
+                Some(norm) => norm.forward(&k)?,
+                None => k,
+            };
+
+            let q = q.transpose(1, 2)?;
+            let k = k.transpose(1, 2)?;
+
+            // Batched RoPE across all sequences with their individual positions
+            let (q, k) = {
+                let rot = &models[0].base_model.layers[l].self_attn.rotary_emb;
+                let cos = rot.cos.index_select(&pos_tensor, 0)?;
+                let sin = rot.sin.index_select(&pos_tensor, 0)?;
+                let cos = Tensor::cat(&[&cos, &cos], D::Minus1)?
+                    .unsqueeze(1)?
+                    .unsqueeze(1)?;
+                let sin = Tensor::cat(&[&sin, &sin], D::Minus1)?
+                    .unsqueeze(1)?
+                    .unsqueeze(1)?;
+                let q_embed = q
+                    .broadcast_mul(&cos)?
+                    .broadcast_add(&rotate_half(&q.contiguous()?)?.broadcast_mul(&sin)?)?;
+                let k_embed = k
+                    .broadcast_mul(&cos)?
+                    .broadcast_add(&rotate_half(&k.contiguous()?)?.broadcast_mul(&sin)?)?;
+                (q_embed, k_embed)
+            };
+
+            // Attention per sequence using each sequence's own pre-allocated KV cache
+            let mut attn_outputs = Vec::with_capacity(b_sz);
+            for (b, model_b) in models.iter_mut().enumerate() {
+                let q_b = q.narrow(0, b, 1)?.contiguous()?;
+                let k_b = k.narrow(0, b, 1)?;
+                let v_b = v.narrow(0, b, 1)?;
+
+                let (past_k, past_v) = model_b.base_model.layers[l]
+                    .self_attn
+                    .append_kv(&k_b, &v_b)?;
+
+                let past_k = repeat_kv(past_k, num_kv_groups)?.contiguous()?;
+                let past_v = repeat_kv(past_v, num_kv_groups)?.contiguous()?;
+
+                let attn_weights = (q_b.matmul(&past_k.transpose(2, 3)?.contiguous()?)? * scale)?;
+                let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
+                let attn_out = attn_weights.matmul(&past_v)?;
+                attn_outputs.push(attn_out);
+            }
+
+            let attn_output = Tensor::cat(&attn_outputs, 0)?;
+            let attn_proj = attn_output
+                .transpose(1, 2)?
+                .reshape((b_sz, 1, num_heads * head_dim))?
+                .apply(&models[0].base_model.layers[l].self_attn.o_proj)?;
+
+            let xs_mid = (residual + attn_proj)?;
+            let norm_mid = models[0].base_model.layers[l]
+                .post_attention_layernorm
+                .forward(&xs_mid)?;
+            let mlp_out = models[0].base_model.layers[l].mlp.forward(&norm_mid)?;
+            xs = (xs_mid + mlp_out)?;
+        }
+
+        let xs = models[0].base_model.norm.forward(&xs)?;
+        let logits = xs.narrow(1, 0, 1)?.apply(&models[0].lm_head)?;
+
+        let last_logits = logits.squeeze(1)?;
+        let next_token_tensor = last_logits.argmax(D::Minus1)?;
+        let next_tokens = next_token_tensor.to_vec1::<u32>()?;
+        Ok(next_tokens)
+    }
+
     pub fn clear_kv_cache(&mut self) {
         self.base_model.clear_kv_cache();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_step_decode_batch_execution() -> candle_core::Result<()> {
+        let dev = Device::Cpu;
+        let cfg = Config {
+            hidden_size: 64,
+            intermediate_size: 128,
+            vocab_size: 100,
+            num_hidden_layers: 2,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            max_position_embeddings: 512,
+            sliding_window: None,
+            max_window_layers: None,
+            tie_word_embeddings: false,
+            rope_theta: 10000.0,
+            rms_norm_eps: 1e-6,
+            use_sliding_window: false,
+            hidden_act: Activation::Silu,
+            head_dim: Some(16),
+            attention_bias: Some(false),
+        };
+
+        let vb = VarBuilder::zeros(DType::F32, &dev);
+        let mut model1 = ModelForCausalLM::new(&cfg, vb.clone())?;
+        let mut model2 = ModelForCausalLM::new(&cfg, vb.clone())?;
+        let mut model3 = ModelForCausalLM::new(&cfg, vb)?;
+
+        // Test batched decode step with 3 sequences at different positions
+        let input_ids = [42u32, 17u32, 88u32];
+        let positions = [0usize, 5usize, 12usize];
+
+        let mut models = [&mut model1, &mut model2, &mut model3];
+        let next_tokens =
+            ModelForCausalLM::step_decode_batch(&mut models, &input_ids, &positions, &dev)?;
+
+        assert_eq!(next_tokens.len(), 3);
+        Ok(())
     }
 }

@@ -6,7 +6,7 @@ Mini-Serve features a pluggable backend interface that isolates tensor math and 
 
 ## 1. The `ModelBackend` Trait
 
-All model engines implement the asynchronous `ModelBackend` trait defined in [`src/backends/traits.rs`](file:///Users/hkarimkonda/Documents/mini-serve-rs/src/backends/traits.rs):
+All model engines implement the asynchronous `ModelBackend` trait defined in [`src/backends/traits.rs`](../src/backends/traits.rs):
 
 ```rust
 #[async_trait]
@@ -30,11 +30,11 @@ pub trait ModelBackend: Send + Sync {
 
 ## 2. Supported Backends
 
-### A. Mock Backend ([`src/backends/mock.rs`](file:///Users/hkarimkonda/Documents/mini-serve-rs/src/backends/mock.rs))
+### A. Mock Backend ([`src/backends/mock.rs`](../src/backends/mock.rs))
 - Simulates realistic text generation and token latency without requiring model weights or GPU hardware.
 - Ideal for unit testing, continuous integration (CI/CD), load testing, and UI validation.
 
-### B. Hugging Face Candle Backend ([`src/backends/candle.rs`](file:///Users/hkarimkonda/Documents/mini-serve-rs/src/backends/candle.rs))
+### B. Hugging Face Candle Backend ([`src/backends/candle.rs`](../src/backends/candle.rs))
 - Uses Hugging Face's pure-Rust `candle` framework with hardware acceleration:
   - **Apple Silicon**: Accelerated using Apple Metal shaders (`Device::Metal`).
   - **NVIDIA GPU**: Accelerated using CUDA kernels (`Device::Cuda`).
@@ -47,7 +47,7 @@ pub trait ModelBackend: Send + Sync {
 
 Upstream `candle-transformers 0.8.4` lacked Metal shader kernels for custom operations (`rms_norm`, `rotary_emb`, `softmax_last_dim`) and was structured for single-sequence CLI demos.
 
-Mini-Serve includes a unified native implementation in [`src/backends/qwen2.rs`](file:///Users/hkarimkonda/Documents/mini-serve-rs/src/backends/qwen2.rs) supporting both **Qwen 2 / 2.5** and **Qwen 3**:
+Mini-Serve includes a unified native implementation in [`src/backends/qwen2.rs`](../src/backends/qwen2.rs) supporting both **Qwen 2 / 2.5** and **Qwen 3**:
 
 ### A. Primitive Metal Shader Decomposition
 We replaced upstream custom ops with primitive tensor operations supported natively by Candle's Metal shaders (`reduce.metal`, `unary.metal`, `binary.metal`):

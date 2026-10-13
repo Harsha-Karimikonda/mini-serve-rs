@@ -44,7 +44,7 @@ sequenceDiagram
 
 Standard KV caches pre-allocate contiguous virtual memory buffers for the maximum sequence length (e.g. 2,048 or 4,096 tokens). In production workloads, prompt and completion lengths vary widely, wasting 60%–80% of VRAM due to internal fragmentation.
 
-### Block Allocation Strategy ([`src/cache/kv_cache.rs`](file:///Users/hkarimkonda/Documents/mini-serve-rs/src/cache/kv_cache.rs))
+### Block Allocation Strategy ([`src/cache/kv_cache.rs`](../src/cache/kv_cache.rs))
 - **Block Size**: Non-contiguous fixed-size physical blocks (default: 16 tokens per block).
 - **Page Table**: Each sequence holds a logical list of physical block IDs (`Vec<usize>`).
 - **Free Stack**: Free block IDs are managed in an $O(1)$ stack.
@@ -64,7 +64,7 @@ $$\text{Fragmentation} = \frac{\text{Unused Token Slots in Allocated Blocks}}{\t
 
 When multiple requests share identical prompt prefixes (e.g., system instructions, few-shot examples, or retrieved context documents in RAG), repeating the prefill forward pass on those tokens is redundant.
 
-### The Hashing & Lookup Algorithm ([`src/cache/prefix_cache.rs`](file:///Users/hkarimkonda/Documents/mini-serve-rs/src/cache/prefix_cache.rs))
+### The Hashing & Lookup Algorithm ([`src/cache/prefix_cache.rs`](../src/cache/prefix_cache.rs))
 1. Prompts are tokenized and partitioned into 16-token chunks:
    $$C_0 = [t_0, \dots, t_{15}], \quad C_1 = [t_{16}, \dots, t_{31}], \quad \dots$$
 2. Each chunk is hashed using a chained cryptographic SHA-256 digest:
@@ -91,4 +91,15 @@ if seq.sender.is_closed() {
 }
 ```
 Cancellation takes effect within a **single token iteration** (< 25 ms), instantly releasing physical KV blocks.
+
+---
+
+## 5. Implementation Status & Active Roadmap
+
+| Capability | Control-Plane Layer ([`src/cache/`](../src/cache/)) | Tensor Execution Layer ([`src/backends/`](../src/backends/)) |
+| :--- | :--- | :--- |
+| **KV-Cache Block Management** | **Active**: 16-token physical block table, admission quota checks, and fragmentation telemetry via `/api/status`. | **Roadmap**: Tensor memory currently resides in per-sequence pre-allocated buffers (`candle_nn::kv_cache::KvCache`). Direct non-contiguous PagedAttention kernels are targeted next. |
+| **Prefix Caching** | **Active**: Chained SHA-256 chunk hashing, LRU eviction (512 chunks), hit/miss counters, and telemetry. | **Roadmap**: Connecting prefix matches to cached KV activation tensors to bypass redundant prompt prefill forward passes. |
+| **Continuous Batching** | **Active**: Dynamic step-by-step admission, client disconnect cancellation, and early EOS sequence eviction. | **Active / Maturing**: Unified batched decode projections (`step_decode_batch`); batched attention across slots in active development. |
+
 

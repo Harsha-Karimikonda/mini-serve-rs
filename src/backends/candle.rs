@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokenizers::Tokenizer;
 use tracing::info;
@@ -18,7 +17,7 @@ pub struct CandleBackend {
     device: Device,
     tokenizer: Tokenizer,
     model_template: Arc<QwenModel>,
-    active_models: Mutex<HashMap<RequestId, QwenModel>>,
+    active_models: Mutex<Vec<(RequestId, QwenModel)>>,
     eos_token_id: u32,
 }
 
@@ -136,7 +135,7 @@ impl CandleBackend {
             device,
             tokenizer,
             model_template: Arc::new(model),
-            active_models: Mutex::new(HashMap::new()),
+            active_models: Mutex::new(Vec::new()),
             eos_token_id,
         })
     }
@@ -164,89 +163,139 @@ impl ModelBackend for CandleBackend {
             return Ok(Vec::new());
         }
 
-        let mut results = Vec::with_capacity(sequences.len());
         let mut active_models_guard = self.active_models.lock();
 
         // Prune any stale models for sequences that are no longer active
-        active_models_guard.retain(|req_id, _| sequences.iter().any(|s| &s.request_id == req_id));
+        active_models_guard.retain(|(req_id, _)| sequences.iter().any(|s| &s.request_id == req_id));
 
-        for seq in sequences.iter_mut() {
-            // Get or clone an isolated model instance for this sequence (zero-copy weight tensors)
-            let model = active_models_guard
-                .entry(seq.request_id.clone())
-                .or_insert_with(|| {
-                    let mut cloned = self.model_template.as_ref().clone();
-                    cloned.clear_kv_cache();
-                    cloned
-                });
-
-            let input_ids = if !seq.is_prefilled {
-                // Prefill pass: feed entire prompt token sequence
-                seq.is_prefilled = true;
-                seq.prompt_tokens.clone()
-            } else {
-                // Decode pass: feed only the latest generated token
-                vec![*seq.output_tokens.last().unwrap_or(&1)]
-            };
-
-            let input_tensor = Tensor::new(input_ids.as_slice(), &self.device)
-                .and_then(|t| t.unsqueeze(0))
-                .map_err(|e| EngineError::BackendError(format!("Tensor creation failed: {}", e)))?;
-
-            let pos = if !seq.output_tokens.is_empty() {
-                seq.prompt_tokens.len() + seq.output_tokens.len() - 1
-            } else {
-                0
-            };
-
-            let step_start = std::time::Instant::now();
-            let logits = model
-                .forward(&input_tensor, pos)
-                .map_err(|e| EngineError::BackendError(format!("Forward pass failed: {}", e)))?;
-            let forward_dur = step_start.elapsed();
-
-            // candle's Qwen2 forward returns [batch_size, 1, vocab_size] narrowed to the last token
-            let last_logits = logits.squeeze(0).and_then(|t| t.squeeze(0)).map_err(|e| {
-                EngineError::BackendError(format!("Logits extraction failed: {}", e))
-            })?;
-
-            // Greedy argmax sampling
-            let next_token_id = last_logits
-                .argmax(0)
-                .and_then(|t| t.to_scalar::<u32>())
-                .map_err(|e| EngineError::BackendError(format!("Argmax failed: {}", e)))?;
-
-            let total_dur = step_start.elapsed();
-            tracing::debug!(
-                "Token step for {}: forward={:?}, total={:?} (pos={})",
-                seq.request_id,
-                forward_dur,
-                total_dur,
-                pos
-            );
-
-            let is_eos = next_token_id == self.eos_token_id
-                || seq.output_tokens.len() + 1 >= seq.sampling.max_tokens;
-
-            let token_text = self
-                .tokenizer
-                .decode(&[next_token_id], false)
-                .unwrap_or_else(|_| " ".to_string());
-
-            results.push(StepToken {
-                token_id: next_token_id,
-                text: token_text,
-                is_eos,
-            });
-        }
-
-        // Clean up models for any sequences that just finished
-        for (i, seq) in sequences.iter().enumerate() {
-            if results[i].is_eos {
-                active_models_guard.remove(&seq.request_id);
+        // Ensure every active sequence has an initialized model
+        for seq in sequences.iter() {
+            if !active_models_guard
+                .iter()
+                .any(|(id, _)| id == &seq.request_id)
+            {
+                let mut cloned = self.model_template.as_ref().clone();
+                cloned.clear_kv_cache();
+                active_models_guard.push((seq.request_id.clone(), cloned));
             }
         }
 
-        Ok(results)
+        // Align active_models_guard to the exact sequence ordering
+        active_models_guard.sort_by_key(|(id, _)| {
+            sequences
+                .iter()
+                .position(|s| &s.request_id == id)
+                .unwrap_or(usize::MAX)
+        });
+
+        let mut results: Vec<Option<StepToken>> = vec![None; sequences.len()];
+
+        // 1. Prefill pass: Execute any un-prefilled sequences individually
+        for (i, seq) in sequences.iter_mut().enumerate() {
+            if !seq.is_prefilled {
+                seq.is_prefilled = true;
+                let model = &mut active_models_guard[i].1;
+                let input_tensor = Tensor::new(seq.prompt_tokens.as_slice(), &self.device)
+                    .and_then(|t| t.unsqueeze(0))
+                    .map_err(|e| {
+                        EngineError::BackendError(format!("Prefill tensor creation failed: {}", e))
+                    })?;
+
+                let pos = 0;
+                let logits = model.forward(&input_tensor, pos).map_err(|e| {
+                    EngineError::BackendError(format!("Prefill forward pass failed: {}", e))
+                })?;
+
+                let last_logits = logits.squeeze(0).and_then(|t| t.squeeze(0)).map_err(|e| {
+                    EngineError::BackendError(format!("Prefill logits extraction failed: {}", e))
+                })?;
+
+                let next_token_id = last_logits
+                    .argmax(0)
+                    .and_then(|t| t.to_scalar::<u32>())
+                    .map_err(|e| EngineError::BackendError(format!("Argmax failed: {}", e)))?;
+
+                let is_eos = next_token_id == self.eos_token_id
+                    || seq.output_tokens.len() + 1 >= seq.sampling.max_tokens;
+
+                let token_text = self
+                    .tokenizer
+                    .decode(&[next_token_id], false)
+                    .unwrap_or_else(|_| " ".to_string());
+
+                results[i] = Some(StepToken {
+                    token_id: next_token_id,
+                    text: token_text,
+                    is_eos,
+                });
+            }
+        }
+
+        // 2. Decode pass: Batch all remaining decode sequences into a single unified GPU forward pass
+        let decode_indices: Vec<usize> = (0..sequences.len())
+            .filter(|&i| results[i].is_none())
+            .collect();
+
+        if !decode_indices.is_empty() {
+            let mut decode_models: Vec<&mut QwenModel> = Vec::with_capacity(decode_indices.len());
+            let mut decode_input_ids: Vec<u32> = Vec::with_capacity(decode_indices.len());
+            let mut decode_positions: Vec<usize> = Vec::with_capacity(decode_indices.len());
+
+            let mut models_iter = active_models_guard.iter_mut();
+            let mut prev_idx = 0;
+            for &idx in &decode_indices {
+                let skip = idx - prev_idx;
+                let (_, model) = models_iter.nth(skip).unwrap();
+                decode_models.push(model);
+                prev_idx = idx + 1;
+
+                let seq = &sequences[idx];
+                let token_id = *seq.output_tokens.last().unwrap_or(&1);
+                decode_input_ids.push(token_id);
+                let pos = if !seq.output_tokens.is_empty() {
+                    seq.prompt_tokens.len() + seq.output_tokens.len() - 1
+                } else {
+                    0
+                };
+                decode_positions.push(pos);
+            }
+
+            let next_tokens = QwenModel::step_decode_batch(
+                &mut decode_models[..],
+                &decode_input_ids,
+                &decode_positions,
+                &self.device,
+            )
+            .map_err(|e| EngineError::BackendError(format!("Batched decode step failed: {}", e)))?;
+
+            for (k, &idx) in decode_indices.iter().enumerate() {
+                let next_token_id = next_tokens[k];
+                let seq = &sequences[idx];
+                let is_eos = next_token_id == self.eos_token_id
+                    || seq.output_tokens.len() + 1 >= seq.sampling.max_tokens;
+
+                let token_text = self
+                    .tokenizer
+                    .decode(&[next_token_id], false)
+                    .unwrap_or_else(|_| " ".to_string());
+
+                results[idx] = Some(StepToken {
+                    token_id: next_token_id,
+                    text: token_text,
+                    is_eos,
+                });
+            }
+        }
+
+        let final_results: Vec<StepToken> = results.into_iter().map(|r| r.unwrap()).collect();
+
+        // Clean up models for any sequences that just finished
+        for (i, seq) in sequences.iter().enumerate() {
+            if final_results[i].is_eos {
+                active_models_guard.retain(|(id, _)| id != &seq.request_id);
+            }
+        }
+
+        Ok(final_results)
     }
 }

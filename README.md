@@ -2,7 +2,7 @@
 
 A blazing-fast, fault-tolerant, high-throughput LLM inference engine and continuous batching control plane written in pure **Rust**.
 
-Inspired by production serving systems (vLLM, TGI, and Together AI), `mini-serve-rs` delivers deterministic, low-latency token streaming with **zero Python GIL contention**, **zero model weight duplication**, and a single **4.7MB** native binary footprint.
+Inspired by production serving systems (vLLM, TGI, and Together AI), `mini-serve-rs` delivers deterministic, low-latency token streaming with **zero Python GIL contention**, **zero model weight duplication**, and a lightweight native binary footprint (**4.7 MB** core / **14.0 MB** with Metal GPU acceleration).
 
 ---
 

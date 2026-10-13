@@ -3,6 +3,7 @@ use crate::core::types::ActiveSequence;
 use async_trait::async_trait;
 use std::sync::Arc;
 
+#[derive(Debug, Clone)]
 pub struct StepToken {
     pub token_id: u32,
     pub text: String,

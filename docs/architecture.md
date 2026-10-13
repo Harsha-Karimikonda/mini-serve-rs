@@ -48,7 +48,7 @@ Mini-Serve is designed from the ground up to solve the architectural bottlenecks
 ```
 
 ### Worker Lifecycle
-Each worker runs an independent continuous batching iteration loop managed by [`src/scheduler/scheduler.rs`](file:///Users/hkarimkonda/Documents/mini-serve-rs/src/scheduler/scheduler.rs):
+Each worker runs an independent continuous batching iteration loop managed by [`src/scheduler/scheduler.rs`](../src/scheduler/scheduler.rs):
 1. **Admission Check**: Inspects the pending queue and current physical KV block availability.
 2. **Forward Step**: Batches active sequences and invokes `backend.step_batch(&mut active_sequences)`.
 3. **Streaming Dispatch**: Emits generated tokens over sequence-specific `tokio::sync::mpsc` channels directly to the client's HTTP response stream.
@@ -58,7 +58,7 @@ Each worker runs an independent continuous batching iteration loop managed by [`
 
 ## 3. Dynamic Latency-Aware Routing
 
-When requests arrive at the gateway, the [`Router`](file:///Users/hkarimkonda/Documents/mini-serve-rs/src/routing/router.rs) assigns them to the optimal worker using a load-scoring algorithm:
+When requests arrive at the gateway, the [`Router`](../src/routing/router.rs) assigns them to the optimal worker using a load-scoring algorithm:
 
 $$\text{Score} = (\text{queue\_depth} + \text{active\_sequences} + 1) \times \text{avg\_latency\_ms}$$
 
