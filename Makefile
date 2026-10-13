@@ -1,7 +1,7 @@
 CARGO ?= cargo
 FEATURES ?= metal
 
-.PHONY: all build run test lint fmt clean
+.PHONY: all build run test bench lint fmt clean
 
 all: build
 
@@ -13,6 +13,9 @@ run:
 
 test:
 	$(CARGO) test --features $(FEATURES)
+
+bench:
+	$(CARGO) run --example bench --features $(FEATURES)
 
 lint:
 	$(CARGO) clippy --features $(FEATURES) --all-targets -- -D warnings

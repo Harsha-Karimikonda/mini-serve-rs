@@ -14,10 +14,8 @@ This document presents empirical benchmark measurements comparing the **Rust Min
 - **Engines Evaluated**:
   - **Rust Mini-Serve (`v0.2.0`)**: Compiled release with native Apple Metal shaders via Candle (`candle-core 0.8.4`).
   - **Python Mini-Inference-Engine (`v0.1.0`)**: FastAPI + Uvicorn + PyTorch (`v2.14.1`) MPS backend with out-of-process gRPC worker.
-- **Benchmark Harness**: Automated end-to-end benchmark suite implemented in [`scripts/benchmark_real_model.py`](../scripts/benchmark_real_model.py).
-  - Manages automated server lifecycles for both Rust (port 8002) and Python (port 8001).
+- **Benchmark Harness**: 100% pure Rust benchmark harness implemented in [`examples/bench.rs`](../examples/bench.rs).
   - Performs health checks via `/health`.
-  - Measures total process-tree RSS using `psutil` (parent process + all descendants).
   - Measures pure prefill Time-To-First-Token (TTFT) via synchronous non-streaming requests (`max_tokens=1`).
   - Measures streaming decode throughput (tokens/second) and inter-token latencies over HTTP/SSE.
   - Measures concurrent continuous batching aggregate throughput ($C=4$ concurrent streams).
@@ -31,14 +29,14 @@ This document presents empirical benchmark measurements comparing the **Rust Min
 
 ### How to Reproduce
 
-Run the automated benchmark script against any supported model:
+Run the pure Rust benchmark harness against any running Mini-Serve instance:
 
 ```bash
-# Evaluate Qwen 3 (0.6B)
-python3 scripts/benchmark_real_model.py --model Qwen/Qwen3-0.6B
+# 1. Start Mini-Serve on Apple Metal
+cargo run --release --features metal -- --port 8002 --model Qwen/Qwen2.5-0.5B-Instruct
 
-# Evaluate Qwen 2.5 (0.5B Instruct)
-python3 scripts/benchmark_real_model.py --model Qwen/Qwen2.5-0.5B-Instruct
+# 2. In another terminal, run the Rust benchmark
+cargo run --example bench --features metal -- --url http://127.0.0.1:8002 --model Qwen/Qwen2.5-0.5B-Instruct
 ```
 
 ---
