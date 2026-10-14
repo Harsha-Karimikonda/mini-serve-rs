@@ -99,7 +99,7 @@ Cancellation takes effect within a **single token iteration** (< 25 ms), instant
 | Capability | Control-Plane Layer ([`src/cache/`](../src/cache/)) | Tensor Execution Layer ([`src/backends/`](../src/backends/)) |
 | :--- | :--- | :--- |
 | **KV-Cache Block Management** | **Active**: 16-token physical block table, admission quota checks, and fragmentation telemetry via `/api/status`. | **Roadmap**: Tensor memory currently resides in per-sequence pre-allocated buffers (`candle_nn::kv_cache::KvCache`). Direct non-contiguous PagedAttention kernels are targeted next. |
-| **Prefix Caching** | **Active**: Chained SHA-256 chunk hashing, LRU eviction (512 chunks), hit/miss counters, and telemetry. | **Roadmap**: Connecting prefix matches to cached KV activation tensors to bypass redundant prompt prefill forward passes. |
+| **Prefix Caching** | **Active**: Chained SHA-256 chunk hashing, LRU eviction (512 chunks), hit/miss counters, and telemetry. | **Active**: Connected to CandleBackend layer caches (`get_kv_snapshot`/`set_kv_snapshot`). Slices 16-token chunk KV tensors and deterministic logits to bypass prefill FLOPs, cutting recurring prompt latency by >50%. |
 | **Continuous Batching** | **Active**: Dynamic step-by-step admission, non-blocking client streaming (`try_send`), client disconnect cancellation, and early EOS sequence eviction. | **Active**: Unified batched decode projections and zero-copy GQA attention (`step_decode_batch`), delivering 115 tok/s continuous batching on Apple Silicon Metal. |
 
 

@@ -37,7 +37,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             settings.model
         );
         match mini_serve::backends::CandleBackend::load_hf(&settings.model, &settings.device) {
-            Ok(candle_backend) => Arc::new(candle_backend),
+            Ok(mut candle_backend) => {
+                candle_backend.set_prefix_cache(prefix_cache.clone());
+                Arc::new(candle_backend)
+            }
             Err(e) => {
                 if settings.allow_mock_fallback {
                     tracing::warn!(

@@ -360,6 +360,22 @@ impl Attention {
         }
     }
 
+    pub fn get_kv_snapshot(&self) -> Option<(Tensor, Tensor)> {
+        if let Some(cache) = &self.kv_cache {
+            if let (Ok(Some(k)), Ok(Some(v))) = (cache.k(), cache.v()) {
+                return Some((k, v));
+            }
+        }
+        None
+    }
+
+    pub fn set_kv_snapshot(&mut self, k: &Tensor, v: &Tensor) -> Result<()> {
+        let mut cache = candle_nn::kv_cache::KvCache::new(2, self.max_seq_len);
+        cache.append(&k.contiguous()?, &v.contiguous()?)?;
+        self.kv_cache = Some(cache);
+        Ok(())
+    }
+
     fn clear_kv_cache(&mut self) {
         if let Some(cache) = &mut self.kv_cache {
             cache.reset();
@@ -409,6 +425,14 @@ impl DecoderLayer {
         let xs = self.post_attention_layernorm.forward(&xs)?;
         let xs = self.mlp.forward(&xs)?;
         residual + xs
+    }
+
+    pub fn get_kv_snapshot(&self) -> Option<(Tensor, Tensor)> {
+        self.self_attn.get_kv_snapshot()
+    }
+
+    pub fn set_kv_snapshot(&mut self, k: &Tensor, v: &Tensor) -> Result<()> {
+        self.self_attn.set_kv_snapshot(k, v)
     }
 
     fn clear_kv_cache(&mut self) {
@@ -514,6 +538,17 @@ impl Model {
             xs = layer.forward(&xs, attention_mask.as_ref(), seqlen_offset)?;
         }
         self.norm.forward(&xs)
+    }
+
+    pub fn get_kv_snapshot(&self) -> Vec<Option<(Tensor, Tensor)>> {
+        self.layers.iter().map(|l| l.get_kv_snapshot()).collect()
+    }
+
+    pub fn set_kv_snapshot(&mut self, snapshot: &[(Tensor, Tensor)]) -> Result<()> {
+        for (layer, (k, v)) in self.layers.iter_mut().zip(snapshot.iter()) {
+            layer.set_kv_snapshot(k, v)?;
+        }
+        Ok(())
     }
 
     pub fn clear_kv_cache(&mut self) {
@@ -689,6 +724,14 @@ impl ModelForCausalLM {
         Ok(last_logits)
     }
 
+    pub fn get_kv_snapshot(&self) -> Vec<Option<(Tensor, Tensor)>> {
+        self.base_model.get_kv_snapshot()
+    }
+
+    pub fn set_kv_snapshot(&mut self, snapshot: &[(Tensor, Tensor)]) -> Result<()> {
+        self.base_model.set_kv_snapshot(snapshot)
+    }
+
     pub fn clear_kv_cache(&mut self) {
         self.base_model.clear_kv_cache();
     }
@@ -788,4 +831,63 @@ mod tests {
         assert!(diff < 1e-5, "Max diff between repeat_kv and zero-copy GQA is {diff}");
         Ok(())
     }
+
+    #[test]
+    fn test_kv_snapshot_save_and_restore() -> candle_core::Result<()> {
+        let dev = Device::Cpu;
+        let cfg = Config {
+            hidden_size: 64,
+            intermediate_size: 128,
+            vocab_size: 100,
+            num_hidden_layers: 2,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            max_position_embeddings: 512,
+            sliding_window: None,
+            max_window_layers: None,
+            tie_word_embeddings: true,
+            rope_theta: 10000.0,
+            rms_norm_eps: 1e-6,
+            use_sliding_window: false,
+            hidden_act: candle_nn::Activation::Silu,
+            head_dim: None,
+            attention_bias: None,
+        };
+
+        let varmap = candle_nn::VarMap::new();
+        let vb = candle_nn::VarBuilder::from_varmap(&varmap, DType::F32, &dev);
+
+        let mut model1 = ModelForCausalLM::new(&cfg, vb.clone())?;
+        let mut model2 = ModelForCausalLM::new(&cfg, vb)?;
+
+        // 1. Model 1 prefills 4 tokens: [10, 20, 30, 40]
+        let input1 = Tensor::new(&[[10u32, 20, 30, 40]], &dev)?;
+        let _ = model1.forward(&input1, 0)?;
+
+        // 2. Extract snapshot from Model 1
+        let snapshot = model1.get_kv_snapshot();
+        assert_eq!(snapshot.len(), 2);
+        assert!(snapshot.iter().all(|s| s.is_some()));
+
+        let pairs: Vec<(Tensor, Tensor)> = snapshot.into_iter().flatten().collect();
+        assert_eq!(pairs[0].0.dims4()?, (1, 2, 4, 16)); // [1, num_kv_heads, 4, head_dim]
+
+        // 3. Restore snapshot into Model 2
+        model2.set_kv_snapshot(&pairs)?;
+
+        // 4. Both models now forward token [50] with seqlen_offset = 4
+        let next_input = Tensor::new(&[[50u32]], &dev)?;
+        let logits1 = model1.forward(&next_input, 4)?;
+        let logits2 = model2.forward(&next_input, 4)?;
+
+        // Verify logits are identical
+        let diff = (logits1 - logits2)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(
+            diff < 1e-5,
+            "Max diff between original and restored model logits: {diff}"
+        );
+
+        Ok(())
+    }
 }
+

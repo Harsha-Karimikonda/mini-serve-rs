@@ -1,3 +1,4 @@
+use candle_core::Tensor;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
@@ -6,6 +7,19 @@ use crate::core::constants::{DEFAULT_BLOCK_SIZE, DEFAULT_PREFIX_CACHE_MAX_CHUNKS
 
 pub const DEFAULT_CHUNK_SIZE: usize = DEFAULT_BLOCK_SIZE;
 pub const DEFAULT_MAX_CHUNKS: usize = DEFAULT_PREFIX_CACHE_MAX_CHUNKS;
+
+#[derive(Debug, Clone)]
+pub struct LayerKVPair {
+    pub k: Tensor,
+    pub v: Tensor,
+}
+
+#[derive(Debug, Clone)]
+pub struct CachedChunk {
+    pub tokens: Vec<u32>,
+    pub kv_layers: Option<Vec<LayerKVPair>>,
+    pub last_logits: Option<Tensor>,
+}
 
 #[derive(Debug, Clone)]
 pub struct PrefixMatch {
@@ -17,7 +31,7 @@ pub struct PrefixMatch {
 pub struct PrefixCache {
     chunk_size: usize,
     max_chunks: usize,
-    chunks: HashMap<String, Vec<u32>>,
+    chunks: HashMap<String, CachedChunk>,
     lru_order: VecDeque<String>,
     hits: usize,
     misses: usize,
@@ -102,17 +116,129 @@ impl PrefixCache {
         }
     }
 
+    pub fn lookup_kv(
+        &mut self,
+        tokens: &[u32],
+    ) -> Option<(usize, Vec<LayerKVPair>, Option<Tensor>)> {
+        let chunk_pairs = Self::compute_chunk_hashes(tokens, self.chunk_size);
+        if chunk_pairs.is_empty() {
+            self.misses += 1;
+            return None;
+        }
+
+        let mut longest_match: Option<(usize, Vec<LayerKVPair>, Option<Tensor>)> = None;
+
+        for (i, (hash, _)) in chunk_pairs.iter().enumerate() {
+            if let Some(chunk) = self.chunks.get(hash) {
+                if let Some(ref kv) = chunk.kv_layers {
+                    let token_count = (i + 1) * self.chunk_size;
+                    let logits = if token_count == tokens.len() {
+                        chunk.last_logits.clone()
+                    } else {
+                        None
+                    };
+                    longest_match = Some((token_count, kv.clone(), logits));
+                }
+                // Refresh LRU
+                if let Some(pos) = self.lru_order.iter().position(|h| h == hash) {
+                    self.lru_order.remove(pos);
+                }
+                self.lru_order.push_back(hash.clone());
+            } else {
+                break;
+            }
+        }
+
+        if let Some((matched_tokens, _, _)) = &longest_match {
+            self.hits += 1;
+            self.tokens_saved += *matched_tokens;
+        } else {
+            self.misses += 1;
+        }
+
+        longest_match
+    }
+
     pub fn insert(&mut self, tokens: &[u32]) {
         let chunk_pairs = Self::compute_chunk_hashes(tokens, self.chunk_size);
         for (hash, chunk_tokens) in chunk_pairs {
-            if !self.chunks.contains_key(&hash) {
-                while self.chunks.len() >= self.max_chunks && !self.lru_order.is_empty() {
-                    if let Some(evicted) = self.lru_order.pop_front() {
-                        self.chunks.remove(&evicted);
+            self.insert_chunk(hash, chunk_tokens, None, None);
+        }
+    }
+
+    pub fn insert_kv(
+        &mut self,
+        tokens: &[u32],
+        full_kv_layers: &[LayerKVPair],
+        last_logits: Option<&Tensor>,
+    ) {
+        let chunk_pairs = Self::compute_chunk_hashes(tokens, self.chunk_size);
+        let num_pairs = chunk_pairs.len();
+        for (i, (hash, chunk_tokens)) in chunk_pairs.into_iter().enumerate() {
+            let chunk_end = (i + 1) * self.chunk_size;
+
+            let mut sliced_layers = Vec::with_capacity(full_kv_layers.len());
+            let mut slice_ok = true;
+            for layer in full_kv_layers {
+                let k_len = layer.k.dim(2).unwrap_or(0);
+                let v_len = layer.v.dim(2).unwrap_or(0);
+                if k_len >= chunk_end && v_len >= chunk_end {
+                    if let (Ok(k), Ok(v)) = (
+                        layer.k.narrow(2, 0, chunk_end).and_then(|t| t.contiguous()),
+                        layer.v.narrow(2, 0, chunk_end).and_then(|t| t.contiguous()),
+                    ) {
+                        sliced_layers.push(LayerKVPair { k, v });
+                    } else {
+                        slice_ok = false;
+                        break;
                     }
+                } else {
+                    slice_ok = false;
+                    break;
                 }
-                self.chunks.insert(hash.clone(), chunk_tokens);
-                self.lru_order.push_back(hash);
+            }
+
+            if slice_ok && sliced_layers.len() == full_kv_layers.len() {
+                let chunk_logits = if i + 1 == num_pairs && chunk_end == tokens.len() {
+                    last_logits.cloned()
+                } else {
+                    None
+                };
+                self.insert_chunk(hash, chunk_tokens, Some(sliced_layers), chunk_logits);
+            }
+        }
+    }
+
+    fn insert_chunk(
+        &mut self,
+        hash: String,
+        tokens: Vec<u32>,
+        kv: Option<Vec<LayerKVPair>>,
+        logits: Option<Tensor>,
+    ) {
+        if !self.chunks.contains_key(&hash) {
+            while self.chunks.len() >= self.max_chunks && !self.lru_order.is_empty() {
+                if let Some(evicted) = self.lru_order.pop_front() {
+                    self.chunks.remove(&evicted);
+                }
+            }
+            self.chunks.insert(
+                hash.clone(),
+                CachedChunk {
+                    tokens,
+                    kv_layers: kv,
+                    last_logits: logits,
+                },
+            );
+            self.lru_order.push_back(hash);
+        } else if kv.is_some() {
+            if let Some(chunk) = self.chunks.get_mut(&hash) {
+                if chunk.kv_layers.is_none() {
+                    chunk.kv_layers = kv;
+                }
+                if chunk.last_logits.is_none() && logits.is_some() {
+                    chunk.last_logits = logits;
+                }
             }
         }
     }

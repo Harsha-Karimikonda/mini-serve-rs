@@ -51,3 +51,50 @@ fn test_prefix_cache_lru_eviction() {
     let lookup_a_after = cache.lookup(&seq_a);
     assert_eq!(lookup_a_after.matched_tokens, 0);
 }
+
+#[test]
+fn test_prefix_cache_insert_and_lookup_kv() -> candle_core::Result<()> {
+    use candle_core::{Device, Tensor};
+    use mini_serve::cache::prefix_cache::LayerKVPair;
+
+    let dev = Device::Cpu;
+    let mut cache = PrefixCache::new(16, 100);
+    let prompt: Vec<u32> = (0..48).collect(); // 3 chunks
+
+    // Mock 2 layers of KV
+    let num_layers = 2;
+    let mut kv_layers = Vec::with_capacity(num_layers);
+    for _ in 0..num_layers {
+        let k = Tensor::randn(0.0f32, 1.0f32, (1, 2, 48, 64), &dev)?;
+        let v = Tensor::randn(0.0f32, 1.0f32, (1, 2, 48, 64), &dev)?;
+        kv_layers.push(LayerKVPair { k, v });
+    }
+    let last_logits = Tensor::randn(0.0f32, 1.0f32, (100,), &dev)?;
+
+    // Initial lookup misses
+    assert!(cache.lookup_kv(&prompt).is_none());
+
+    // Insert KV
+    cache.insert_kv(&prompt, &kv_layers, Some(&last_logits));
+
+    // Full match on same prompt
+    let full_hit = cache.lookup_kv(&prompt);
+    assert!(full_hit.is_some());
+    let (matched, layers, logits) = full_hit.unwrap();
+    assert_eq!(matched, 48);
+    assert_eq!(layers.len(), 2);
+    assert_eq!(layers[0].k.dims4()?, (1, 2, 48, 64));
+    assert!(logits.is_some());
+
+    // Partial match on a prompt that extends the first 32 tokens
+    let mut prompt_ext: Vec<u32> = (0..32).collect();
+    prompt_ext.extend(vec![999, 1000, 1001]); // 35 tokens total
+    let partial_hit = cache.lookup_kv(&prompt_ext);
+    assert!(partial_hit.is_some());
+    let (matched, layers, logits) = partial_hit.unwrap();
+    assert_eq!(matched, 32);
+    assert_eq!(layers[0].k.dims4()?, (1, 2, 32, 64));
+    assert!(logits.is_none());
+
+    Ok(())
+}

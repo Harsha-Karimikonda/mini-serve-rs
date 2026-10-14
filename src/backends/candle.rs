@@ -19,6 +19,7 @@ pub struct CandleBackend {
     model_template: Arc<QwenModel>,
     active_models: Mutex<Vec<(RequestId, QwenModel)>>,
     eos_token_id: u32,
+    prefix_cache: Option<crate::cache::SharedPrefixCache>,
 }
 
 impl CandleBackend {
@@ -167,7 +168,12 @@ impl CandleBackend {
             model_template: Arc::new(model),
             active_models: Mutex::new(Vec::new()),
             eos_token_id,
+            prefix_cache: None,
         })
+    }
+
+    pub fn set_prefix_cache(&mut self, prefix_cache: crate::cache::SharedPrefixCache) {
+        self.prefix_cache = Some(prefix_cache);
     }
 }
 
@@ -225,20 +231,106 @@ impl ModelBackend for CandleBackend {
             if !seq.is_prefilled {
                 seq.is_prefilled = true;
                 let model = &mut active_models_guard[i].1;
-                let input_tensor = Tensor::new(seq.prompt_tokens.as_slice(), &self.device)
-                    .and_then(|t| t.unsqueeze(0))
-                    .map_err(|e| {
-                        EngineError::BackendError(format!("Prefill tensor creation failed: {}", e))
+
+                // Check prefix cache for reusable KV activations
+                let matched_kv = if let Some(ref pc) = self.prefix_cache {
+                    pc.lock().lookup_kv(&seq.prompt_tokens)
+                } else {
+                    None
+                };
+
+                let last_logits = if let Some((matched_tokens, kv_layers, cached_logits)) = matched_kv {
+                    let snapshot_pairs: Vec<(Tensor, Tensor)> = kv_layers
+                        .into_iter()
+                        .map(|pair| (pair.k, pair.v))
+                        .collect();
+                    model.set_kv_snapshot(&snapshot_pairs).map_err(|e| {
+                        EngineError::BackendError(format!("Failed to set KV snapshot: {}", e))
                     })?;
 
-                let pos = 0;
-                let logits = model.forward(&input_tensor, pos).map_err(|e| {
-                    EngineError::BackendError(format!("Prefill forward pass failed: {}", e))
-                })?;
+                    if matched_tokens < seq.prompt_tokens.len() {
+                        let remaining_tokens = &seq.prompt_tokens[matched_tokens..];
+                        let input_tensor = Tensor::new(remaining_tokens, &self.device)
+                            .and_then(|t| t.unsqueeze(0))
+                            .map_err(|e| {
+                                EngineError::BackendError(format!(
+                                    "Prefill remaining tensor creation failed: {}",
+                                    e
+                                ))
+                            })?;
 
-                let last_logits = logits.squeeze(0).and_then(|t| t.squeeze(0)).map_err(|e| {
-                    EngineError::BackendError(format!("Prefill logits extraction failed: {}", e))
-                })?;
+                        let logits = model
+                            .forward(&input_tensor, matched_tokens)
+                            .map_err(|e| {
+                                EngineError::BackendError(format!(
+                                    "Prefill remaining forward pass failed: {}",
+                                    e
+                                ))
+                            })?;
+                        logits.squeeze(0).and_then(|t| t.squeeze(0)).map_err(|e| {
+                            EngineError::BackendError(format!(
+                                "Prefill logits extraction failed: {}",
+                                e
+                            ))
+                        })?
+                    } else if let Some(logits) = cached_logits {
+                        logits
+                    } else {
+                        let last_tok = *seq.prompt_tokens.last().unwrap_or(&1);
+                        let input_tensor = Tensor::new(&[last_tok], &self.device)
+                            .and_then(|t| t.unsqueeze(0))
+                            .map_err(|e| {
+                                EngineError::BackendError(format!(
+                                    "Prefill last-token tensor creation failed: {}",
+                                    e
+                                ))
+                            })?;
+                        let logits = model
+                            .forward(&input_tensor, seq.prompt_tokens.len() - 1)
+                            .map_err(|e| {
+                                EngineError::BackendError(format!(
+                                    "Prefill last-token forward pass failed: {}",
+                                    e
+                                ))
+                            })?;
+                        logits.squeeze(0).and_then(|t| t.squeeze(0)).map_err(|e| {
+                            EngineError::BackendError(format!(
+                                "Prefill logits extraction failed: {}",
+                                e
+                            ))
+                        })?
+                    }
+                } else {
+                    let input_tensor = Tensor::new(seq.prompt_tokens.as_slice(), &self.device)
+                        .and_then(|t| t.unsqueeze(0))
+                        .map_err(|e| {
+                            EngineError::BackendError(format!(
+                                "Prefill tensor creation failed: {}",
+                                e
+                            ))
+                        })?;
+
+                    let pos = 0;
+                    let logits = model.forward(&input_tensor, pos).map_err(|e| {
+                        EngineError::BackendError(format!("Prefill forward pass failed: {}", e))
+                    })?;
+
+                    logits.squeeze(0).and_then(|t| t.squeeze(0)).map_err(|e| {
+                        EngineError::BackendError(format!("Prefill logits extraction failed: {}", e))
+                    })?
+                };
+
+                // Insert the completed prompt's KV into prefix_cache for future requests
+                if let Some(ref pc) = self.prefix_cache {
+                    let snapshot = model.get_kv_snapshot();
+                    let full_kv: Option<Vec<crate::cache::prefix_cache::LayerKVPair>> = snapshot
+                        .into_iter()
+                        .map(|opt| opt.map(|(k, v)| crate::cache::prefix_cache::LayerKVPair { k, v }))
+                        .collect();
+                    if let Some(layers) = full_kv {
+                        pc.lock().insert_kv(&seq.prompt_tokens, &layers, Some(&last_logits));
+                    }
+                };
 
                 let seed = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
