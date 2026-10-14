@@ -31,8 +31,11 @@ pub struct Settings {
     #[arg(long, env = "MINI_BLOCK_SIZE", default_value_t = 16)]
     pub block_size: usize,
 
-    #[arg(long, env = "MINI_NUM_WORKERS", default_value_t = 2)]
+    #[arg(long, env = "MINI_NUM_WORKERS", default_value_t = 1)]
     pub num_workers: usize,
+
+    #[arg(long, env = "MINI_ALLOW_MOCK_FALLBACK", default_value_t = false)]
+    pub allow_mock_fallback: bool,
 
     #[arg(long, env = "MINI_LOG_LEVEL", default_value = "info")]
     pub log_level: String,
@@ -54,7 +57,8 @@ impl Default for Settings {
             max_waiting_requests: DEFAULT_MAX_WAITING_REQUESTS,
             kv_cache_blocks: DEFAULT_KV_CACHE_BLOCKS,
             block_size: DEFAULT_BLOCK_SIZE,
-            num_workers: 2,
+            num_workers: 1,
+            allow_mock_fallback: false,
             log_level: "info".to_string(),
             hf_token: None,
         }

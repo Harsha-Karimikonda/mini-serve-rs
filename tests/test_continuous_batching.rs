@@ -54,7 +54,7 @@ async fn test_continuous_batching_dynamic_admission_and_early_eos() {
     while let Some(evt) = rx_a.recv().await {
         match evt {
             TokenEvent::Token(t) => tokens_a.push(t),
-            TokenEvent::Done(_) => break,
+            TokenEvent::Done { .. } => break,
             TokenEvent::Error(e) => panic!("Error in Seq A: {}", e),
         }
     }
@@ -65,7 +65,7 @@ async fn test_continuous_batching_dynamic_admission_and_early_eos() {
     while let Some(evt) = rx_b.recv().await {
         match evt {
             TokenEvent::Token(t) => tokens_b.push(t),
-            TokenEvent::Done(_) => break,
+            TokenEvent::Done { .. } => break,
             TokenEvent::Error(e) => panic!("Error in Seq B: {}", e),
         }
     }
@@ -113,4 +113,63 @@ async fn test_continuous_batching_client_cancellation() {
 
     // Cache blocks must be recovered immediately!
     assert_eq!(cache.lock().allocated_count(), 0);
+}
+
+#[tokio::test]
+async fn test_slow_client_does_not_stall_batch() {
+    let cache = create_shared_cache(256, 16);
+    let prefix_cache = create_shared_prefix_cache(16, 128);
+    let backend = Arc::new(MockBackend::new("mock", 1));
+
+    let scheduler = Arc::new(Scheduler::new(4, 32, cache.clone(), prefix_cache, backend));
+    scheduler.start_loop();
+
+    // Sequence 1: Slow client with max_tokens: 100, but we NEVER read from its rx channel!
+    // Since channel buffer is 64, it will fill up quickly.
+    let sampling_slow = SamplingParams {
+        temperature: 1.0,
+        top_p: 1.0,
+        max_tokens: 100,
+        stop: vec![],
+    };
+    let _rx_slow = scheduler
+        .submit(
+            RequestId("slow-client".to_string()),
+            "Slow prompt".to_string(),
+            sampling_slow,
+        )
+        .await
+        .unwrap();
+
+    // Sequence 2: Fast client with max_tokens: 5, reads immediately.
+    let sampling_fast = SamplingParams {
+        temperature: 1.0,
+        top_p: 1.0,
+        max_tokens: 5,
+        stop: vec![],
+    };
+    let mut rx_fast = scheduler
+        .submit(
+            RequestId("fast-client".to_string()),
+            "Fast prompt".to_string(),
+            sampling_fast,
+        )
+        .await
+        .unwrap();
+
+    let mut fast_tokens = Vec::new();
+    let mut fast_finish_reason = String::new();
+    while let Some(evt) = rx_fast.recv().await {
+        match evt {
+            TokenEvent::Token(t) => fast_tokens.push(t),
+            TokenEvent::Done { finish_reason, .. } => {
+                fast_finish_reason = finish_reason;
+                break;
+            }
+            TokenEvent::Error(e) => panic!("Error in fast client: {}", e),
+        }
+    }
+
+    assert_eq!(fast_tokens.len(), 5);
+    assert_eq!(fast_finish_reason, "length");
 }

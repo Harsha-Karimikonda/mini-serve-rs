@@ -174,6 +174,34 @@ impl Module for MLP {
     }
 }
 
+/// Computes single-token (seq_len=1) attention using grouped-query attention without copying or repeating KV cache.
+/// `q`: shape `[num_heads, head_dim]`
+/// `k`: shape `[num_kv_heads, kv_len, head_dim]`
+/// `v`: shape `[num_kv_heads, kv_len, head_dim]`
+/// Returns: shape `[num_heads, head_dim]`
+pub fn decode_attention_gqa_zero_copy(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    num_kv_heads: usize,
+    num_kv_groups: usize,
+    scale: f64,
+) -> Result<Tensor> {
+    let mut head_outputs = Vec::with_capacity(num_kv_heads);
+    for h in 0..num_kv_heads {
+        let q_group = q.narrow(0, h * num_kv_groups, num_kv_groups)?; // [num_kv_groups, head_dim]
+        let k_mat = k.narrow(0, h, 1)?.squeeze(0)?; // [kv_len, head_dim]
+        let v_mat = v.narrow(0, h, 1)?.squeeze(0)?; // [kv_len, head_dim]
+
+        let k_t = k_mat.t()?; // [head_dim, kv_len]
+        let scores = (q_group.matmul(&k_t)? * scale)?; // [num_kv_groups, kv_len]
+        let probs = candle_nn::ops::softmax(&scores, D::Minus1)?;
+        let out_group = probs.matmul(&v_mat)?; // [num_kv_groups, head_dim]
+        head_outputs.push(out_group);
+    }
+    Tensor::cat(&head_outputs, 0)
+}
+
 #[derive(Debug, Clone)]
 pub struct Attention {
     pub q_proj: Linear,
@@ -284,10 +312,24 @@ impl Attention {
 
         let (key_states, value_states) = self.append_kv(&key_states, &value_states)?;
 
-        let key_states = repeat_kv(key_states, self.num_kv_groups)?.contiguous()?;
-        let value_states = repeat_kv(value_states, self.num_kv_groups)?.contiguous()?;
+        let attn_output = if b_sz == 1 && q_len == 1 && attention_mask.is_none() {
+            let scale = 1f64 / f64::sqrt(self.head_dim as f64);
+            let q_b = query_states.squeeze(0)?.squeeze(1)?;
+            let k_b = key_states.squeeze(0)?;
+            let v_b = value_states.squeeze(0)?;
+            let out_2d = decode_attention_gqa_zero_copy(
+                &q_b,
+                &k_b,
+                &v_b,
+                self.num_kv_heads,
+                self.num_kv_groups,
+                scale,
+            )?;
+            out_2d.reshape((1, 1, self.num_heads * self.head_dim))?
+        } else {
+            let key_states = repeat_kv(key_states, self.num_kv_groups)?.contiguous()?;
+            let value_states = repeat_kv(value_states, self.num_kv_groups)?.contiguous()?;
 
-        let attn_output = {
             let scale = 1f64 / f64::sqrt(self.head_dim as f64);
             let attn_weights = (query_states.matmul(&key_states.transpose(2, 3)?)? * scale)?;
 
@@ -296,12 +338,12 @@ impl Attention {
                 Some(mask) => attn_weights.broadcast_add(mask)?,
             };
             let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
-            attn_weights.matmul(&value_states)?
+            attn_weights
+                .matmul(&value_states)?
+                .transpose(1, 2)?
+                .reshape((b_sz, q_len, self.num_heads * self.head_dim))?
         };
-        attn_output
-            .transpose(1, 2)?
-            .reshape((b_sz, q_len, self.num_heads * self.head_dim))?
-            .apply(&self.o_proj)
+        attn_output.apply(&self.o_proj)
     }
 
     pub fn append_kv(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
@@ -516,17 +558,18 @@ impl ModelForCausalLM {
         input_ids: &[u32],
         positions: &[usize],
         device: &Device,
-    ) -> Result<Vec<u32>> {
+    ) -> Result<Tensor> {
         let b_sz = models.len();
         if b_sz == 0 {
-            return Ok(Vec::new());
+            return Err(candle_core::Error::Msg(
+                "Empty batch provided to step_decode_batch".to_string(),
+            ));
         }
         if b_sz == 1 {
             let input_tensor = Tensor::new(&[input_ids[0]], device)?.unsqueeze(0)?;
             let logits = models[0].forward(&input_tensor, positions[0])?;
-            let last_logits = logits.squeeze(0)?.squeeze(0)?;
-            let next_token_id = last_logits.argmax(0)?.to_scalar::<u32>()?;
-            return Ok(vec![next_token_id]);
+            let last_logits = logits.squeeze(1)?;
+            return Ok(last_logits);
         }
 
         // 1. Batched Token Embeddings: [b_sz, 1] -> [b_sz, 1, hidden_size]
@@ -601,10 +644,10 @@ impl ModelForCausalLM {
                 (q_embed, k_embed)
             };
 
-            // Attention per sequence using each sequence's own pre-allocated KV cache
+            // Attention per sequence using each sequence's own pre-allocated KV cache with zero-copy GQA
             let mut attn_outputs = Vec::with_capacity(b_sz);
             for (b, model_b) in models.iter_mut().enumerate() {
-                let q_b = q.narrow(0, b, 1)?.contiguous()?;
+                let q_b = q.narrow(0, b, 1)?.squeeze(0)?.squeeze(1)?; // [num_heads, head_dim]
                 let k_b = k.narrow(0, b, 1)?;
                 let v_b = v.narrow(0, b, 1)?;
 
@@ -612,18 +655,22 @@ impl ModelForCausalLM {
                     .self_attn
                     .append_kv(&k_b, &v_b)?;
 
-                let past_k = repeat_kv(past_k, num_kv_groups)?.contiguous()?;
-                let past_v = repeat_kv(past_v, num_kv_groups)?.contiguous()?;
+                let past_k = past_k.squeeze(0)?; // [num_kv_heads, kv_len, head_dim]
+                let past_v = past_v.squeeze(0)?; // [num_kv_heads, kv_len, head_dim]
 
-                let attn_weights = (q_b.matmul(&past_k.transpose(2, 3)?.contiguous()?)? * scale)?;
-                let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
-                let attn_out = attn_weights.matmul(&past_v)?;
-                attn_outputs.push(attn_out);
+                let out_2d = decode_attention_gqa_zero_copy(
+                    &q_b,
+                    &past_k,
+                    &past_v,
+                    num_kv_heads,
+                    num_kv_groups,
+                    scale,
+                )?;
+                attn_outputs.push(out_2d.unsqueeze(0)?); // [1, num_heads, head_dim]
             }
 
-            let attn_output = Tensor::cat(&attn_outputs, 0)?;
+            let attn_output = Tensor::cat(&attn_outputs, 0)?; // [b_sz, num_heads, head_dim]
             let attn_proj = attn_output
-                .transpose(1, 2)?
                 .reshape((b_sz, 1, num_heads * head_dim))?
                 .apply(&models[0].base_model.layers[l].self_attn.o_proj)?;
 
@@ -639,9 +686,7 @@ impl ModelForCausalLM {
         let logits = xs.narrow(1, 0, 1)?.apply(&models[0].lm_head)?;
 
         let last_logits = logits.squeeze(1)?;
-        let next_token_tensor = last_logits.argmax(D::Minus1)?;
-        let next_tokens = next_token_tensor.to_vec1::<u32>()?;
-        Ok(next_tokens)
+        Ok(last_logits)
     }
 
     pub fn clear_kv_cache(&mut self) {
@@ -685,10 +730,62 @@ mod tests {
         let positions = [0usize, 5usize, 12usize];
 
         let mut models = [&mut model1, &mut model2, &mut model3];
-        let next_tokens =
+        let logits =
             ModelForCausalLM::step_decode_batch(&mut models, &input_ids, &positions, &dev)?;
 
-        assert_eq!(next_tokens.len(), 3);
+        assert_eq!(logits.dims2()?, (3, 100));
+        Ok(())
+    }
+
+    #[test]
+    fn test_gqa_broadcast_matmul() -> candle_core::Result<()> {
+        let dev = Device::Cpu;
+        let b_sz = 2;
+        let num_kv_heads = 2;
+        let num_kv_groups = 7;
+        let num_heads = 14;
+        let head_dim = 64;
+        let kv_len = 100;
+
+        let q = Tensor::randn(0.0f32, 1.0f32, (b_sz, num_heads, 1, head_dim), &dev)?;
+        let k = Tensor::randn(0.0f32, 1.0f32, (b_sz, num_kv_heads, kv_len, head_dim), &dev)?;
+        let v = Tensor::randn(0.0f32, 1.0f32, (b_sz, num_kv_heads, kv_len, head_dim), &dev)?;
+
+        // 1. Traditional repeat_kv method:
+        let scale = 1f64 / f64::sqrt(head_dim as f64);
+        let k_rep = repeat_kv(k.clone(), num_kv_groups)?.contiguous()?;
+        let v_rep = repeat_kv(v.clone(), num_kv_groups)?.contiguous()?;
+        let scores_rep = (q.matmul(&k_rep.transpose(2, 3)?)? * scale)?;
+        let probs_rep = candle_nn::ops::softmax(&scores_rep, candle_core::D::Minus1)?;
+        let expected_out = probs_rep
+            .matmul(&v_rep)?
+            .transpose(1, 2)?
+            .reshape((b_sz, 1, num_heads * head_dim))?;
+
+        // 2. Zero-copy GQA method:
+        let q_b = q.narrow(0, 0, 1)?.squeeze(0)?.squeeze(1)?; // [14, 64]
+        let k_b = k.narrow(0, 0, 1)?.squeeze(0)?; // [2, 100, 64]
+        let v_b = v.narrow(0, 0, 1)?.squeeze(0)?; // [2, 100, 64]
+
+        let mut head_outputs = Vec::with_capacity(num_kv_heads);
+        for h in 0..num_kv_heads {
+            let q_group = q_b.narrow(0, h * num_kv_groups, num_kv_groups)?; // [7, 64]
+            let k_mat = k_b.narrow(0, h, 1)?.squeeze(0)?; // [100, 64] (2D)
+            let v_mat = v_b.narrow(0, h, 1)?.squeeze(0)?; // [100, 64] (2D)
+
+            let k_t = k_mat.t()?; // [64, 100] (2D)
+            let scores = (q_group.matmul(&k_t)? * scale)?; // [7, 100]
+            let probs = candle_nn::ops::softmax(&scores, candle_core::D::Minus1)?;
+            let out_group = probs.matmul(&v_mat)?; // [7, 64]
+            head_outputs.push(out_group);
+        }
+        let full_out = Tensor::cat(&head_outputs, 0)?; // [14, 64]
+        let actual_out = full_out.reshape((1, 1, num_heads * head_dim))?;
+
+        // Verify batch 0 slice matches expected
+        let expected_b0 = expected_out.narrow(0, 0, 1)?;
+        let diff = (expected_b0 - actual_out)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(diff < 1e-5, "Max diff between repeat_kv and zero-copy GQA is {diff}");
         Ok(())
     }
 }

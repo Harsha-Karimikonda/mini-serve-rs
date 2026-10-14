@@ -83,6 +83,21 @@ impl KVCache {
         Ok(blocks)
     }
 
+    pub fn allocate_block(&mut self, request_id: &str) -> Result<usize, EngineError> {
+        if self.free_blocks.is_empty() {
+            return Err(EngineError::CachePressure(
+                "KV cache pressure: no free blocks remaining for incremental allocation"
+                    .to_string(),
+            ));
+        }
+        let block = self.free_blocks.pop().unwrap();
+        self.allocations
+            .entry(request_id.to_string())
+            .or_default()
+            .push(block);
+        Ok(block)
+    }
+
     pub fn release(&mut self, request_id: &str) -> usize {
         if let Some(blocks) = self.allocations.remove(request_id) {
             let count = blocks.len();

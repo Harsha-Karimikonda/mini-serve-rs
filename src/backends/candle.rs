@@ -30,32 +30,56 @@ impl CandleBackend {
         let local_slug_path = std::path::Path::new("models").join(&normalized_slug);
         let local_models_path = std::path::Path::new("models").join(model_id);
 
-        let (tokenizer_path, config_path, model_path) = if local_path.is_dir()
-            && local_path.join("model.safetensors").exists()
+        let (tokenizer_path, config_path, model_paths) = if local_path.is_dir()
+            && (local_path.join("model.safetensors").exists()
+                || local_path.join("model.safetensors.index.json").exists())
         {
             info!("Loading model from local path: {:?}", local_path);
+            let weights = resolve_model_weights_local(local_path).ok_or_else(|| {
+                EngineError::BackendError(format!(
+                    "Failed to find valid model weights in local path: {:?}",
+                    local_path
+                ))
+            })?;
             (
                 local_path.join("tokenizer.json"),
                 local_path.join("config.json"),
-                local_path.join("model.safetensors"),
+                weights,
             )
-        } else if local_slug_path.is_dir() && local_slug_path.join("model.safetensors").exists() {
+        } else if local_slug_path.is_dir()
+            && (local_slug_path.join("model.safetensors").exists()
+                || local_slug_path.join("model.safetensors.index.json").exists())
+        {
             info!("Loading model from local directory: {:?}", local_slug_path);
+            let weights = resolve_model_weights_local(&local_slug_path).ok_or_else(|| {
+                EngineError::BackendError(format!(
+                    "Failed to find valid model weights in slug path: {:?}",
+                    local_slug_path
+                ))
+            })?;
             (
                 local_slug_path.join("tokenizer.json"),
                 local_slug_path.join("config.json"),
-                local_slug_path.join("model.safetensors"),
+                weights,
             )
-        } else if local_models_path.is_dir() && local_models_path.join("model.safetensors").exists()
+        } else if local_models_path.is_dir()
+            && (local_models_path.join("model.safetensors").exists()
+                || local_models_path.join("model.safetensors.index.json").exists())
         {
             info!(
                 "Loading model from local directory: {:?}",
                 local_models_path
             );
+            let weights = resolve_model_weights_local(&local_models_path).ok_or_else(|| {
+                EngineError::BackendError(format!(
+                    "Failed to find valid model weights in models path: {:?}",
+                    local_models_path
+                ))
+            })?;
             (
                 local_models_path.join("tokenizer.json"),
                 local_models_path.join("config.json"),
-                local_models_path.join("model.safetensors"),
+                weights,
             )
         } else {
             info!("Fetching model {} from Hugging Face hub...", model_id);
@@ -85,10 +109,8 @@ impl CandleBackend {
             let cfg = repo
                 .get("config.json")
                 .map_err(|e| EngineError::BackendError(format!("Failed to fetch config: {}", e)))?;
-            let w = repo.get("model.safetensors").map_err(|e| {
-                EngineError::BackendError(format!("Failed to fetch model weights: {}", e))
-            })?;
-            (tok, cfg, w)
+            let weights = resolve_model_weights_hf(&repo)?;
+            (tok, cfg, weights)
         };
 
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
@@ -104,7 +126,15 @@ impl CandleBackend {
             #[cfg(feature = "metal")]
             "metal" | "auto" => Device::new_metal(0).unwrap_or(Device::Cpu),
             #[cfg(feature = "cuda")]
-            "cuda" => Device::new_cuda(0).unwrap_or(Device::Cpu),
+            "cuda" => Device::new_cuda(0).map_err(|e| {
+                EngineError::BackendError(format!("CUDA device initialization failed: {}", e))
+            })?,
+            #[cfg(not(feature = "cuda"))]
+            "cuda" => {
+                return Err(EngineError::BackendError(
+                    "CUDA device requested but 'cuda' feature is not compiled into mini-serve".to_string(),
+                ));
+            }
             _ => Device::Cpu,
         };
         info!("Using device: {:?}", device);
@@ -115,7 +145,7 @@ impl CandleBackend {
         };
 
         let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[model_path], dtype, &device).map_err(|e| {
+            VarBuilder::from_mmaped_safetensors(&model_paths, dtype, &device).map_err(|e| {
                 EngineError::BackendError(format!("Failed to mmap safetensors: {}", e))
             })?
         };
@@ -210,18 +240,25 @@ impl ModelBackend for CandleBackend {
                     EngineError::BackendError(format!("Prefill logits extraction failed: {}", e))
                 })?;
 
-                let next_token_id = last_logits
-                    .argmax(0)
-                    .and_then(|t| t.to_scalar::<u32>())
-                    .map_err(|e| EngineError::BackendError(format!("Argmax failed: {}", e)))?;
+                let seed = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+                let next_token_id = sample_token(&last_logits, &seq.sampling, seed)?;
 
-                let is_eos = next_token_id == self.eos_token_id
-                    || seq.output_tokens.len() + 1 >= seq.sampling.max_tokens;
+                let token_text = decode_next_token(
+                    &self.tokenizer,
+                    &seq.output_tokens,
+                    next_token_id,
+                    &seq.output_text,
+                );
 
-                let token_text = self
-                    .tokenizer
-                    .decode(&[next_token_id], false)
-                    .unwrap_or_else(|_| " ".to_string());
+                let is_stop_token = seq
+                    .sampling
+                    .stop
+                    .iter()
+                    .any(|s| !s.is_empty() && (token_text == *s || token_text.contains(s)));
+                let is_eos = next_token_id == self.eos_token_id || is_stop_token;
 
                 results[i] = Some(StepToken {
                     token_id: next_token_id,
@@ -260,7 +297,7 @@ impl ModelBackend for CandleBackend {
                 decode_positions.push(pos);
             }
 
-            let next_tokens = QwenModel::step_decode_batch(
+            let batched_logits = QwenModel::step_decode_batch(
                 &mut decode_models[..],
                 &decode_input_ids,
                 &decode_positions,
@@ -269,15 +306,32 @@ impl ModelBackend for CandleBackend {
             .map_err(|e| EngineError::BackendError(format!("Batched decode step failed: {}", e)))?;
 
             for (k, &idx) in decode_indices.iter().enumerate() {
-                let next_token_id = next_tokens[k];
                 let seq = &sequences[idx];
-                let is_eos = next_token_id == self.eos_token_id
-                    || seq.output_tokens.len() + 1 >= seq.sampling.max_tokens;
+                let seq_logits = batched_logits
+                    .get(k)
+                    .map_err(|e| EngineError::BackendError(format!("Logits extraction failed: {}", e)))?;
 
-                let token_text = self
-                    .tokenizer
-                    .decode(&[next_token_id], false)
-                    .unwrap_or_else(|_| " ".to_string());
+                let seed = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64
+                    + k as u64;
+
+                let next_token_id = sample_token(&seq_logits, &seq.sampling, seed)?;
+
+                let token_text = decode_next_token(
+                    &self.tokenizer,
+                    &seq.output_tokens,
+                    next_token_id,
+                    &seq.output_text,
+                );
+
+                let is_stop_token = seq
+                    .sampling
+                    .stop
+                    .iter()
+                    .any(|s| !s.is_empty() && (token_text == *s || token_text.contains(s)));
+                let is_eos = next_token_id == self.eos_token_id || is_stop_token;
 
                 results[idx] = Some(StepToken {
                     token_id: next_token_id,
@@ -289,13 +343,144 @@ impl ModelBackend for CandleBackend {
 
         let final_results: Vec<StepToken> = results.into_iter().map(|r| r.unwrap()).collect();
 
-        // Clean up models for any sequences that just finished
+        // Clean up models for any sequences that just finished (EOS or max_tokens reached)
         for (i, seq) in sequences.iter().enumerate() {
-            if final_results[i].is_eos {
+            if final_results[i].is_eos || seq.output_tokens.len() + 1 >= seq.sampling.max_tokens {
                 active_models_guard.retain(|(id, _)| id != &seq.request_id);
             }
         }
 
         Ok(final_results)
     }
+
+    fn cancel_sequence(&self, request_id: &RequestId) {
+        let mut active_models_guard = self.active_models.lock();
+        active_models_guard.retain(|(id, _)| id != request_id);
+    }
+}
+
+fn decode_next_token(
+    tokenizer: &Tokenizer,
+    current_output_tokens: &[u32],
+    next_token_id: u32,
+    current_text: &str,
+) -> String {
+    let mut all_tokens = Vec::with_capacity(current_output_tokens.len() + 1);
+    all_tokens.extend_from_slice(current_output_tokens);
+    all_tokens.push(next_token_id);
+    match tokenizer.decode(&all_tokens, false) {
+        Ok(new_full_text) => {
+            let clean_text = if new_full_text.ends_with('\u{FFFD}') {
+                new_full_text.trim_end_matches('\u{FFFD}').to_string()
+            } else {
+                new_full_text
+            };
+            if clean_text.len() >= current_text.len() && clean_text.starts_with(current_text) {
+                clean_text[current_text.len()..].to_string()
+            } else {
+                tokenizer
+                    .decode(&[next_token_id], false)
+                    .unwrap_or_else(|_| " ".to_string())
+            }
+        }
+        Err(_) => tokenizer
+            .decode(&[next_token_id], false)
+            .unwrap_or_else(|_| " ".to_string()),
+    }
+}
+
+fn sample_token(
+    logits: &Tensor,
+    sampling: &crate::core::types::SamplingParams,
+    seed: u64,
+) -> Result<u32, EngineError> {
+    let logits = logits
+        .to_device(&Device::Cpu)
+        .and_then(|t| t.to_dtype(DType::F32))
+        .map_err(|e| EngineError::BackendError(format!("Moving logits to CPU failed: {}", e)))?;
+
+    if sampling.temperature <= 0.0 {
+        logits
+            .argmax(0)
+            .and_then(|t| t.to_scalar::<u32>())
+            .map_err(|e| EngineError::BackendError(format!("Argmax failed: {}", e)))
+    } else {
+        let temp = Some(sampling.temperature as f64);
+        let top_p = if sampling.top_p > 0.0 && sampling.top_p < 1.0 {
+            Some(sampling.top_p as f64)
+        } else {
+            None
+        };
+        let mut lp = candle_transformers::generation::LogitsProcessor::new(seed, temp, top_p);
+        lp.sample(&logits)
+            .map_err(|e| EngineError::BackendError(format!("Sampling failed: {}", e)))
+    }
+}
+
+fn resolve_model_weights_local(dir: &std::path::Path) -> Option<Vec<std::path::PathBuf>> {
+    let single_file = dir.join("model.safetensors");
+    if single_file.exists() {
+        return Some(vec![single_file]);
+    }
+    let index_file = dir.join("model.safetensors.index.json");
+    if index_file.exists() {
+        if let Ok(content) = std::fs::read_to_string(&index_file) {
+            if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(weight_map) = json_val.get("weight_map").and_then(|v| v.as_object()) {
+                    let mut filenames: Vec<String> = weight_map
+                        .values()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect::<std::collections::HashSet<_>>()
+                        .into_iter()
+                        .collect();
+                    filenames.sort();
+                    let paths: Vec<std::path::PathBuf> =
+                        filenames.into_iter().map(|f| dir.join(f)).collect();
+                    if !paths.is_empty() && paths.iter().all(|p| p.exists()) {
+                        return Some(paths);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn resolve_model_weights_hf(
+    repo: &hf_hub::api::sync::ApiRepo,
+) -> Result<Vec<std::path::PathBuf>, EngineError> {
+    if let Ok(w) = repo.get("model.safetensors") {
+        return Ok(vec![w]);
+    }
+    if let Ok(idx_path) = repo.get("model.safetensors.index.json") {
+        let content = std::fs::read_to_string(&idx_path).map_err(|e| {
+            EngineError::BackendError(format!("Failed to read safetensors index: {}", e))
+        })?;
+        let json_val: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
+            EngineError::BackendError(format!("Failed to parse safetensors index: {}", e))
+        })?;
+        if let Some(weight_map) = json_val.get("weight_map").and_then(|v| v.as_object()) {
+            let mut filenames: Vec<String> = weight_map
+                .values()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            filenames.sort();
+            let mut paths = Vec::with_capacity(filenames.len());
+            for f in filenames {
+                let p = repo.get(&f).map_err(|e| {
+                    EngineError::BackendError(format!("Failed to fetch weight shard {}: {}", f, e))
+                })?;
+                paths.push(p);
+            }
+            if !paths.is_empty() {
+                return Ok(paths);
+            }
+        }
+    }
+    Err(EngineError::BackendError(
+        "Could not find model.safetensors or model.safetensors.index.json in model repository"
+            .to_string(),
+    ))
 }

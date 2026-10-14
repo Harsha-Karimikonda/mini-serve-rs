@@ -117,7 +117,7 @@ async fn completions_handler(
         let stream_model = req.model.clone();
         let telemetry = state.telemetry.clone();
 
-        let sse_stream = ReceiverStream::new(rx).map(move |event| match event {
+        let sse_stream = ReceiverStream::new(rx).flat_map(move |event| match event {
             TokenEvent::Token(token_text) => {
                 telemetry.record_tokens(1);
                 let chunk = CompletionChunk {
@@ -131,11 +131,27 @@ async fn completions_handler(
                         finish_reason: None,
                     }],
                 };
-                Ok::<Event, Infallible>(
-                    Event::default().data(serde_json::to_string(&chunk).unwrap()),
-                )
+                futures_util::stream::iter(vec![
+                    Ok::<Event, Infallible>(Event::default().data(serde_json::to_string(&chunk).unwrap())),
+                ])
             }
-            TokenEvent::Done(_) => Ok::<Event, Infallible>(Event::default().data("[DONE]")),
+            TokenEvent::Done { finish_reason, .. } => {
+                let final_chunk = CompletionChunk {
+                    id: stream_req_id.clone(),
+                    object: "text_completion.chunk".to_string(),
+                    created: now_secs(),
+                    model: stream_model.clone(),
+                    choices: vec![CompletionChunkChoice {
+                        text: String::new(),
+                        index: 0,
+                        finish_reason: Some(finish_reason),
+                    }],
+                };
+                futures_util::stream::iter(vec![
+                    Ok::<Event, Infallible>(Event::default().data(serde_json::to_string(&final_chunk).unwrap())),
+                    Ok::<Event, Infallible>(Event::default().data("[DONE]")),
+                ])
+            }
             TokenEvent::Error(err_msg) => {
                 let err_json = json!({
                     "error": {
@@ -144,9 +160,9 @@ async fn completions_handler(
                         "code": 500
                     }
                 });
-                Ok::<Event, Infallible>(
-                    Event::default().data(serde_json::to_string(&err_json).unwrap()),
-                )
+                futures_util::stream::iter(vec![
+                    Ok::<Event, Infallible>(Event::default().data(serde_json::to_string(&err_json).unwrap())),
+                ])
             }
         });
 
@@ -161,14 +177,16 @@ async fn completions_handler(
             completion_tokens: 0,
             total_tokens: 0,
         };
+        let mut final_finish_reason = "stop".to_string();
 
         while let Some(event) = rx.recv().await {
             match event {
                 TokenEvent::Token(text) => {
                     full_text.push_str(&text);
                 }
-                TokenEvent::Done(usage) => {
+                TokenEvent::Done { usage, finish_reason } => {
                     final_usage = usage;
+                    final_finish_reason = finish_reason;
                     break;
                 }
                 TokenEvent::Error(err) => {
@@ -188,7 +206,7 @@ async fn completions_handler(
                 text: full_text,
                 index: 0,
                 logprobs: None,
-                finish_reason: Some("stop".to_string()),
+                finish_reason: Some(final_finish_reason),
             }],
             usage: final_usage,
         };
@@ -243,7 +261,7 @@ async fn chat_completions_handler(
         let stream_model = req.model.clone();
         let telemetry = state.telemetry.clone();
 
-        let sse_stream = ReceiverStream::new(rx).map(move |event| match event {
+        let sse_stream = ReceiverStream::new(rx).flat_map(move |event| match event {
             TokenEvent::Token(token_text) => {
                 telemetry.record_tokens(1);
                 let chunk = ChatCompletionChunk {
@@ -260,11 +278,30 @@ async fn chat_completions_handler(
                         finish_reason: None,
                     }],
                 };
-                Ok::<Event, Infallible>(
-                    Event::default().data(serde_json::to_string(&chunk).unwrap()),
-                )
+                futures_util::stream::iter(vec![
+                    Ok::<Event, Infallible>(Event::default().data(serde_json::to_string(&chunk).unwrap())),
+                ])
             }
-            TokenEvent::Done(_) => Ok::<Event, Infallible>(Event::default().data("[DONE]")),
+            TokenEvent::Done { finish_reason, .. } => {
+                let final_chunk = ChatCompletionChunk {
+                    id: stream_req_id.clone(),
+                    object: "chat.completion.chunk".to_string(),
+                    created: now_secs(),
+                    model: stream_model.clone(),
+                    choices: vec![ChatChunkChoice {
+                        index: 0,
+                        delta: ChatChunkDelta {
+                            role: None,
+                            content: None,
+                        },
+                        finish_reason: Some(finish_reason),
+                    }],
+                };
+                futures_util::stream::iter(vec![
+                    Ok::<Event, Infallible>(Event::default().data(serde_json::to_string(&final_chunk).unwrap())),
+                    Ok::<Event, Infallible>(Event::default().data("[DONE]")),
+                ])
+            }
             TokenEvent::Error(err_msg) => {
                 let err_json = json!({
                     "error": {
@@ -273,9 +310,9 @@ async fn chat_completions_handler(
                         "code": 500
                     }
                 });
-                Ok::<Event, Infallible>(
-                    Event::default().data(serde_json::to_string(&err_json).unwrap()),
-                )
+                futures_util::stream::iter(vec![
+                    Ok::<Event, Infallible>(Event::default().data(serde_json::to_string(&err_json).unwrap())),
+                ])
             }
         });
 
@@ -290,14 +327,16 @@ async fn chat_completions_handler(
             completion_tokens: 0,
             total_tokens: 0,
         };
+        let mut final_finish_reason = "stop".to_string();
 
         while let Some(event) = rx.recv().await {
             match event {
                 TokenEvent::Token(text) => {
                     full_text.push_str(&text);
                 }
-                TokenEvent::Done(usage) => {
+                TokenEvent::Done { usage, finish_reason } => {
                     final_usage = usage;
+                    final_finish_reason = finish_reason;
                     break;
                 }
                 TokenEvent::Error(err) => {
@@ -319,7 +358,7 @@ async fn chat_completions_handler(
                     role: "assistant".to_string(),
                     content: full_text,
                 },
-                finish_reason: Some("stop".to_string()),
+                finish_reason: Some(final_finish_reason),
             }],
             usage: final_usage,
         };

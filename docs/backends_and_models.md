@@ -39,7 +39,9 @@ pub trait ModelBackend: Send + Sync {
   - **Apple Silicon**: Accelerated using Apple Metal shaders (`Device::Metal`).
   - **NVIDIA GPU**: Accelerated using CUDA kernels (`Device::Cuda`).
   - **CPU**: Portable fallback using multi-threaded BLAS (`Device::Cpu`).
-- Memory-maps model weights from `.safetensors` files using zero-copy virtual memory.
+- **Multi-File Sharded Safetensors**: Automatically parses `model.safetensors.index.json` to load and memory-map multi-gigabyte models split across multiple shard files into `VarBuilder::from_mmaped_safetensors`.
+- **Incremental UTF-8 Decoding**: Maintains cumulative token slices and defers incomplete multi-byte replacement suffixes, preventing emoji and non-ASCII character corruption.
+- **Full Sampling Support**: Seamlessly supports greedy argmax (`temperature = 0.0`) and multinomial sampling (`temperature > 0.0`, `top_p`, `seed`) with stop token detection via `candle_transformers::generation::LogitsProcessor`.
 
 ---
 
@@ -58,7 +60,15 @@ We replaced upstream custom ops with primitive tensor operations supported nativ
 | **RoPE** | $x \odot \cos + \text{rotate\_half}(x) \odot \sin$ | `rotate_half` via `narrow`, `neg`, and `cat`, followed by element-wise `broadcast_mul` and addition |
 | **Softmax** | $\text{Softmax}(A)$ | Standard `candle_nn::ops::softmax(&attn_weights, D::Minus1)` |
 
-### B. Qwen 3 Innovations Handled
+### B. Zero-Copy Grouped-Query Attention (GQA)
+In standard implementations, grouped-query attention repeats the key and value heads to match query heads via `repeat_kv(...).contiguous()`. This creates two full copies of the accumulated KV cache on *every single decoding token*, causing throughput to collapse on longer contexts.
+
+Mini-Serve implements `decode_attention_gqa_zero_copy` in [`src/backends/qwen2.rs`](../src/backends/qwen2.rs):
+- **Per-KV-Head Matrix Multiplication**: The Query tensor is sliced by KV group into `[num_kv_groups, head_dim]`.
+- **Direct 2D Cache Attention**: Multiplies directly against 2D Key and Value cache slices (`[kv_len, head_dim]`), eliminating `repeat_kv` and all tensor copying entirely.
+- **Hardware Efficiency**: Uses 2D GEMM kernels that maximize Apple Silicon Metal and BLAS throughput without non-contiguous striding faults.
+
+### C. Qwen 3 Innovations Handled
 1. **QK-Normalization:**
    - Qwen 3 applies RMSNorm to projected Query and Key states per-head before Rotary Positional Embeddings.
    - Handled via `q_norm` and `k_norm` layers in `Attention`:

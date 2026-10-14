@@ -1,5 +1,5 @@
 use crate::core::errors::EngineError;
-use crate::core::types::ActiveSequence;
+use crate::core::types::{ActiveSequence, RequestId};
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -18,6 +18,7 @@ pub trait ModelBackend: Send + Sync {
         &self,
         sequences: &mut [ActiveSequence],
     ) -> Result<Vec<StepToken>, EngineError>;
+    fn cancel_sequence(&self, _request_id: &RequestId) {}
 }
 
 pub type SharedBackend = Arc<dyn ModelBackend>;

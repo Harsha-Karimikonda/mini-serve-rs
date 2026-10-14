@@ -104,8 +104,8 @@ async fn test_completion_non_streaming() {
     let body = res.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["object"], "text_completion");
-    assert_eq!(json["choices"][0]["finish_reason"], "stop");
-    assert!(json["usage"]["completion_tokens"].as_u64().unwrap() > 0);
+    assert_eq!(json["choices"][0]["finish_reason"], "length");
+    assert_eq!(json["usage"]["completion_tokens"].as_u64().unwrap(), 5);
 }
 
 #[tokio::test]

@@ -89,9 +89,8 @@ impl ModelBackend for MockBackend {
 
         for seq in sequences.iter_mut() {
             let next_idx = seq.output_tokens.len();
-            let is_eos = next_idx + 1 >= seq.sampling.max_tokens;
-
             let word = self.vocabulary[next_idx % self.vocabulary.len()];
+            let is_eos = word == "safely.";
             let token_text = if next_idx == 0 {
                 word.to_string()
             } else {

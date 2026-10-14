@@ -190,7 +190,10 @@ pub struct ModelListResponse {
 #[derive(Debug, Clone)]
 pub enum TokenEvent {
     Token(String),
-    Done(TokenUsage),
+    Done {
+        usage: TokenUsage,
+        finish_reason: String,
+    },
     Error(String),
 }
 

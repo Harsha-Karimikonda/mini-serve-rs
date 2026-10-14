@@ -39,11 +39,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match mini_serve::backends::CandleBackend::load_hf(&settings.model, &settings.device) {
             Ok(candle_backend) => Arc::new(candle_backend),
             Err(e) => {
-                tracing::error!(
-                    "Failed to load Candle model: {}. Falling back to MockBackend.",
-                    e
-                );
-                Arc::new(MockBackend::new(&settings.model, 3))
+                if settings.allow_mock_fallback {
+                    tracing::warn!(
+                        "Failed to load Candle model: {}. Falling back to MockBackend (--allow-mock-fallback enabled).",
+                        e
+                    );
+                    Arc::new(MockBackend::new(&settings.model, 3))
+                } else {
+                    tracing::error!(
+                        "Failed to load Candle model: {}. Terminating (pass --allow-mock-fallback to override).",
+                        e
+                    );
+                    return Err(e.into());
+                }
             }
         }
     };
@@ -68,7 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let router = Arc::new(Router::new(worker_handles));
 
     let state = AppState {
-        router,
+        router: Arc::clone(&router),
         cache,
         prefix_cache,
         telemetry,
@@ -84,6 +92,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+
+    info!("Shutting down continuous batching schedulers...");
+    for worker in router.workers() {
+        worker.scheduler.shutdown();
+    }
 
     info!("Mini-Serve gracefully terminated");
     Ok(())

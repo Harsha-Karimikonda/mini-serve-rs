@@ -175,11 +175,11 @@ impl Scheduler {
                             }
                         }
 
-                        // Allocate KV cache blocks
-                        let total_tokens_est = prompt_tokens.len() + item.sampling.max_tokens;
+                        // Allocate initial KV cache blocks for prompt tokens
+                        let initial_tokens = prompt_tokens.len().max(1);
                         let blocks = {
                             let mut cache = self.cache.lock();
-                            cache.allocate(&item.request_id.0, total_tokens_est)
+                            cache.allocate(&item.request_id.0, initial_tokens)
                         };
 
                         match blocks {
@@ -224,6 +224,7 @@ impl Scheduler {
                         active[i].request_id
                     );
                     let cancelled = active.swap_remove(i);
+                    self.backend.cancel_sequence(&cancelled.request_id);
                     self.cache.lock().release(&cancelled.request_id.0);
                 } else {
                     i += 1;
@@ -241,7 +242,8 @@ impl Scheduler {
                 Err(err) => {
                     warn!("Backend step_batch error: {}", err);
                     for seq in active.drain(..) {
-                        let _ = seq.tx.send(TokenEvent::Error(err.to_string())).await;
+                        let _ = seq.tx.try_send(TokenEvent::Error(err.to_string()));
+                        self.backend.cancel_sequence(&seq.request_id);
                         self.cache.lock().release(&seq.request_id.0);
                     }
                     self.active_count.store(0, Ordering::Relaxed);
@@ -259,16 +261,50 @@ impl Scheduler {
                 seq.output_tokens.push(step.token_id);
                 seq.output_text.push_str(&step.text);
 
-                // Stream token to client
-                let _ = seq.tx.send(TokenEvent::Token(step.text)).await;
+                // Dynamically allocate a new KV block if generation crosses block boundary
+                let total_tokens_now = seq.prompt_tokens.len() + seq.output_tokens.len();
+                let block_size = self.cache.lock().block_size();
+                let current_capacity = seq.kv_blocks.len() * block_size;
+                if total_tokens_now > current_capacity {
+                    match self.cache.lock().allocate_block(&seq.request_id.0) {
+                        Ok(new_block) => {
+                            seq.kv_blocks.push(new_block);
+                        }
+                        Err(err) => {
+                            warn!("KV cache exhausted for request {}: {}", seq.request_id, err);
+                            seq.is_finished = true;
+                            seq.finish_reason = Some("length".to_string());
+                        }
+                    }
+                }
 
-                if step.is_eos || seq.output_tokens.len() >= seq.sampling.max_tokens {
-                    seq.is_finished = true;
-                    seq.finish_reason = if step.is_eos {
-                        Some("stop".to_string())
-                    } else {
-                        Some("length".to_string())
-                    };
+                // Stream token to client without blocking batch progress
+                match seq.tx.try_send(TokenEvent::Token(step.text)) {
+                    Ok(_) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        warn!(
+                            "Client channel full for request {}, dropping slow client to avoid stalling batch",
+                            seq.request_id
+                        );
+                        seq.is_finished = true;
+                        seq.finish_reason = Some("error".to_string());
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        seq.is_finished = true;
+                        seq.finish_reason = Some("abort".to_string());
+                    }
+                }
+
+                if !seq.is_finished {
+                    let hit_max = seq.output_tokens.len() >= seq.sampling.max_tokens;
+                    if step.is_eos || hit_max {
+                        seq.is_finished = true;
+                        seq.finish_reason = Some(if step.is_eos {
+                            "stop".to_string()
+                        } else {
+                            "length".to_string()
+                        });
+                    }
                 }
             }
 
@@ -280,7 +316,14 @@ impl Scheduler {
 
                     if finished.is_finished {
                         let usage = finished.usage();
-                        let _ = finished.tx.send(TokenEvent::Done(usage)).await;
+                        let finish_reason = finished
+                            .finish_reason
+                            .clone()
+                            .unwrap_or_else(|| "stop".to_string());
+                        let _ = finished.tx.try_send(TokenEvent::Done {
+                            usage,
+                            finish_reason,
+                        });
 
                         // Insert prompt into prefix cache for future requests
                         self.prefix_cache.lock().insert(&finished.prompt_tokens);
@@ -294,7 +337,8 @@ impl Scheduler {
                         lats.push_back(duration);
                     }
 
-                    // Instant KV-cache block recovery!
+                    // Instant backend model slot and KV-cache block recovery!
+                    self.backend.cancel_sequence(&finished.request_id);
                     self.cache.lock().release(&finished.request_id.0);
                 } else {
                     j += 1;

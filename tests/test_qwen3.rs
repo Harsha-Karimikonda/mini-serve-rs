@@ -50,7 +50,7 @@ async fn test_qwen3_load_and_generate() {
                 std::io::Write::flush(&mut std::io::stdout()).unwrap();
                 generated_tokens.push(token);
             }
-            TokenEvent::Done(usage) => {
+            TokenEvent::Done { usage, .. } => {
                 println!(
                     "\n[Sequence completed: {} prompt tokens, {} completion tokens]",
                     usage.prompt_tokens, usage.completion_tokens
