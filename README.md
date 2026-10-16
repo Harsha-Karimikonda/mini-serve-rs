@@ -95,7 +95,7 @@ Run the full automated test suite:
 ```bash
 make test
 ```
-The default suite runs 46 unit and integration tests, including CPU tensor regressions for interleaved workers and prefix restoration, channel saturation, cancellation, API termination, configuration/request boundaries, tensor budgeting, and shared stop handling. The pretrained Qwen3 test and four manual diagnostics (chat formatting, runtime blocking, registry contention, and real-model health latency) are explicitly ignored by default. Metal-feature builds also discover a separately ignored GPU integration gate, run explicitly below. Place its tokenizer, config, and safetensors in `models/Qwen3-0.6B`, then run:
+The default suite runs 49 unit and integration tests, including CPU tensor regressions for interleaved workers and prefix restoration, channel saturation, cancellation, API termination, configuration/request boundaries, tensor budgeting, and shared stop handling. The pretrained Qwen3 test and four manual diagnostics (chat formatting, runtime blocking, registry contention, and real-model health latency) are explicitly ignored by default. Metal-feature builds also discover a separately ignored GPU integration gate, run explicitly below. Place its tokenizer, config, and safetensors in `models/Qwen3-0.6B`, then run:
 
 ```bash
 cargo test --locked --test test_qwen3 -- --ignored
@@ -106,7 +106,8 @@ cargo test --locked --features metal --test test_qwen3 -- --ignored
 Every completed change requires actual GPU inference verification. Run
 `make gpu-check` with local Qwen3-0.6B weights and host Metal access. The gate
 asserts an actual Metal device and checks prefix reuse, stops, EOS, shared-worker
-outputs, cancellation, and memory-budget rejection/recovery. See
+outputs, cancellation, memory-budget rejection/recovery, and fail-closed routing
+after an injected execution error following real GPU forwards. See
 [GPU verification results](docs/gpu_validation.md) for the recorded run and limits.
 
 Explicitly requested model tests fail if weights are absent. CPU fixture tests and Metal compilation do not establish pretrained-model or GPU inference correctness. See the [prioritized implementation plan](docs/continuous_batching_and_kv_cache.md#52-priority-and-delivery-order) for remaining work.

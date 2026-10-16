@@ -1,6 +1,6 @@
 use parking_lot::Mutex;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
@@ -30,6 +30,7 @@ pub struct SchedulerMetrics {
 }
 
 pub struct Scheduler {
+    accepting: AtomicBool,
     max_batch_size: usize,
     max_waiting_requests: usize,
     cache: SharedKVCache,
@@ -51,6 +52,7 @@ impl Scheduler {
         backend: Arc<dyn ModelBackend>,
     ) -> Self {
         Self {
+            accepting: AtomicBool::new(true),
             max_batch_size,
             max_waiting_requests,
             cache,
@@ -61,6 +63,27 @@ impl Scheduler {
             active_count: Arc::new(AtomicUsize::new(0)),
             latencies: Arc::new(Mutex::new(VecDeque::with_capacity(64))),
             shutdown: Arc::new(Notify::new()),
+        }
+    }
+
+    pub fn is_healthy(&self) -> bool {
+        self.accepting.load(Ordering::Acquire) && self.backend.is_healthy()
+    }
+
+    fn check_health(&self) -> Result<(), EngineError> {
+        if self.is_healthy() {
+            Ok(())
+        } else {
+            Err(EngineError::NoHealthyWorkers(
+                "Worker unavailable; restart required after backend failure".into(),
+            ))
+        }
+    }
+
+    fn record_failure(&self, error: &EngineError) {
+        if matches!(error, EngineError::BackendError(_)) {
+            self.accepting.store(false, Ordering::Release);
+            self.backend.mark_unhealthy();
         }
     }
 
@@ -96,6 +119,7 @@ impl Scheduler {
         prompt: String,
         sampling: SamplingParams,
     ) -> Result<mpsc::Receiver<TokenEvent>, EngineError> {
+        self.check_health()?;
         sampling.validate()?;
         if prompt.trim().is_empty() {
             return Err(EngineError::InvalidRequest("Prompt cannot be empty".into()));
@@ -148,6 +172,7 @@ impl Scheduler {
             }
         }
         let mut queue = self.queue.lock();
+        self.check_health()?;
         if queue.len() >= self.max_waiting_requests {
             return Err(EngineError::AdmissionError(format!(
                 "Queue saturated: {} requests pending",
@@ -191,6 +216,22 @@ impl Scheduler {
         let mut active: Vec<ActiveSequence> = Vec::with_capacity(self.max_batch_size);
 
         loop {
+            if !self.is_healthy() {
+                for mut seq in active.drain(..) {
+                    self.backend.cancel_sequence(&seq.request_id);
+                    self.cache.lock().release(&seq.request_id.0);
+                    seq.send_terminal(TokenEvent::Error(
+                        "Worker unavailable; restart required".into(),
+                    ));
+                }
+                for item in self.queue.lock().drain(..) {
+                    item.terminal_permit.send(TokenEvent::Error(
+                        "Worker unavailable; restart required".into(),
+                    ));
+                }
+                self.active_count.store(0, Ordering::Relaxed);
+                break;
+            }
             // Dynamic Admission: Admit waiting requests up to max_batch_size
             while active.len() < self.max_batch_size {
                 let item = {
@@ -212,10 +253,14 @@ impl Scheduler {
                             prompt_tokens.len(),
                             item.sampling.max_tokens,
                         ) {
+                            self.record_failure(&err);
                             // Backends may have partially prepared request state.
                             self.backend.cancel_sequence(&item.request_id);
                             item.terminal_permit
                                 .send(TokenEvent::Error(err.to_string()));
+                            if !self.is_healthy() {
+                                break;
+                            }
                             continue;
                         }
 
@@ -264,13 +309,18 @@ impl Scheduler {
                 }
             }
 
+            if !self.is_healthy() {
+                continue;
+            }
             self.active_count.store(active.len(), Ordering::Relaxed);
 
             // If no sequences active, sleep until a new request arrives
             if active.is_empty() {
                 tokio::select! {
                     _ = self.queue_notify.notified() => continue,
-                    _ = self.shutdown.notified() => break,
+                    _ = self.shutdown.notified() => continue,
+                    // Observe quarantine published by another worker sharing this backend.
+                    _ = tokio::time::sleep(Duration::from_millis(25)) => continue,
                 }
             }
 
@@ -332,11 +382,12 @@ impl Scheduler {
             let step_tokens: Vec<StepToken> = match self.backend.step_batch(&mut active).await {
                 Ok(toks) => toks,
                 Err(err) => {
+                    self.record_failure(&err);
                     warn!("Backend step_batch error: {}", err);
                     for mut seq in active.drain(..) {
-                        seq.send_terminal(TokenEvent::Error(err.to_string()));
                         self.backend.cancel_sequence(&seq.request_id);
                         self.cache.lock().release(&seq.request_id.0);
+                        seq.send_terminal(TokenEvent::Error(err.to_string()));
                     }
                     self.active_count.store(0, Ordering::Relaxed);
                     continue;
@@ -435,6 +486,7 @@ impl Scheduler {
     }
 
     pub fn shutdown(&self) {
+        self.accepting.store(false, Ordering::Release);
         self.shutdown.notify_one();
     }
 }

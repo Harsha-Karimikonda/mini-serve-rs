@@ -90,3 +90,38 @@ After adding this gate, `cargo fmt --check`, default and Metal-feature
 suite explicitly ignores five model/manual checks, and the Metal suite ignores
 six because it also discovers this GPU gate. The separately invoked command
 above actually executes the GPU gate and reports one pass.
+
+## Allocation and execution-failure policy verification (2026-10-16)
+
+The gate now wraps the real Candle backend with a test-only fault injector. With
+injection disabled it repeats all comparisons above, including successful GPU
+inference after a tensor reservation rejection. It then returns a synthetic
+`BackendError` after the second successful real-model forward of a new streaming
+request (128-token limit, prompt `The capital of France is`, greedy temperature
+0, top-p 1). The stream delivers ` Paris` before an explicit error and closes
+without `[DONE]`. Both schedulers sharing the backend become unavailable;
+`/ready` and subsequent JSON admission return 503. Active KV, execution, and
+prefix reservations and logical blocks return to zero. Both worker tasks exit.
+
+This verifies cleanup and fail-closed routing after a *returned* execution error
+with actual pretrained GPU tensors. It does not deliberately exhaust unified
+memory or simulate a Metal command-buffer/driver failure. The backend remains
+quarantined until process restart; no inference retry or device recovery is
+attempted. See [failure policy](device_failures.md) for the error contract.
+
+The same artifact SHA-256 identities, Apple M4 hardware, actual
+`Metal(MetalDevice(DeviceId(1)))`, F16 weights, sampling, and 512 MiB budget above
+apply. The first extended run passed one GPU test in 28.51 seconds (28.46 seconds
+inside the test). A final rerun after the test-helper lint fix passed in 30.40
+seconds (30.31 seconds inside the test), with the same observations and memory
+values. Peak reservations were 188,183,808 bytes; cleanup retained only
+33,554,432 bytes of fixed headroom. Exact commands:
+
+```bash
+shasum -a 256 models/Qwen3-0.6B/config.json models/Qwen3-0.6B/tokenizer.json models/Qwen3-0.6B/model.safetensors
+system_profiler SPDisplaysDataType
+cargo test --locked --features metal --test test_gpu_inference -- --ignored --nocapture
+```
+
+Host GPU access was used. No CPU fallback counts toward this result. This is a
+working-tree validation; no validating commit or hosted CI run has been created.

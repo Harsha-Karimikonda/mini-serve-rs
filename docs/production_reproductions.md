@@ -1,6 +1,6 @@
-# Production blocker reproductions
+# Production blocker investigation record
 
-Executed on **2026-10-16** against the current working tree. These are focused reproductions, not a production load test or a throughput benchmark. Implementation work continued during the review: tensor reservations and shared stop handling were present in the code tested here.
+Historical measurements executed on **2026-10-16** against the working tree at the time. These are focused reproductions, not a production load test or a throughput benchmark. Implementation work continued during the review: tensor reservations and shared stop handling were present in the code tested here.
 
 ## Results
 
@@ -16,30 +16,27 @@ The real-model run used local `models/Qwen3-0.6B` weights, greedy sampling, a **
 
 After adding the diagnostics, the normal default and Metal-feature `--all-targets` suites each passed **46 tests**, with **five explicitly ignored tests**. The ignored cases are the two known-gap assertions, two opt-in diagnostics, and the existing pretrained smoke test. The real-model diagnostic was executed separately as described above. Metal-feature Clippy across all targets with warnings denied, formatting, and documentation link/whitespace checks also passed.
 
-## Reproduction commands
+## Retained regression checks
 
-Run from the repository root with Rust installed. `--offline` assumes dependencies are already cached; omit it when fetching dependencies is needed.
+The manual latency and mutex-contention probes have been removed. The measurements above are retained as historical investigation evidence; their original commands are no longer available. They do not establish the current implementation's latency or contention behavior.
 
-### CPU fixtures and controlled probes
-
-```bash
-cargo test --locked --offline --features metal --lib production_reproductions -- \
-  --include-ignored --nocapture --test-threads=1 --skip real_model
-```
-
-At the tested snapshot, this command runs five cases: **three pass and two fail**. The chat-formatting and controlled health-responsiveness tests intentionally assert desired behavior, so they fail while those gaps remain. They are explicitly ignored in the normal suite. The two stop tests are normal regression tests; the mutex probe is an opt-in diagnostic.
-
-These fixtures run on CPU even with the Metal feature compiled. Omit `--features metal` on a CPU-only build.
-
-### Real-model Metal probes
+The two stop regressions now live in `src/backends/candle.rs` under `correctness_tests`. They use a zero-weight tiny Qwen CPU fixture (64 vocabulary entries, 32 hidden dimensions, two layers), with greedy sampling (`temperature=0`, `top_p=1`, `max_tokens=4`), to check single-token and spanning stops. The ignored chat-template expectation now lives in `tests/test_api.rs` with its capture backend. It still asserts the desired Qwen-style template, which the route does not yet apply.
 
 ```bash
-MINI_REPRO_DEVICE=metal cargo test --locked --offline --features metal --lib \
-  production_reproductions::real_model_health_latency -- \
-  --ignored --nocapture --test-threads=1
+cargo test --locked --offline --lib correctness_tests -- --nocapture
+cargo test --locked --offline --test test_api --test test_stop_handling
+cargo test --locked --offline --test test_api chat_route_applies_role_delimiters -- --ignored --nocapture
 ```
 
-Requires local weights and host Metal access. This diagnostic performs the real health probe and the sequential/simultaneous prefill comparison. It checks completion consistency and cleanup; timings are printed without a hardware-independent performance threshold. Use `MINI_REPRO_DEVICE=cpu` and omit the Metal feature for a CPU measurement, which was not executed for the pretrained model in this run.
+The last command is expected to fail until model-specific chat formatting is implemented. It exercises a capture backend, with no pretrained inference.
+
+The retained pretrained GPU regression explicitly selects `metal` and asserts the actual device is Metal. It covers single-fragment, spanning, and incomplete stops through both JSON and SSE, alongside prefix reuse, shared workers, and resource cleanup:
+
+```bash
+cargo test --locked --offline --features metal --test test_gpu_inference pretrained_gpu_memory_prefix_stops_and_workers -- --ignored --nocapture --test-threads=1
+```
+
+It uses local `models/Qwen3-0.6B` pretrained weights with greedy sampling (`temperature=0`, `top_p=1`); stop checks use a 12-token limit and the prompt `The capital of France is`.
 
 ### Memory-budget behavior
 
@@ -52,12 +49,36 @@ The first command executes two Candle CPU-fixture tests, including backend-failu
 
 ## Implementation and follow-up
 
-Diagnostics live in [`production_reproductions.rs`](../src/backends/production_reproductions.rs), compiled only under `cfg(test)` from the Candle module. They exercise existing code without fixing the production paths. Existing memory coverage lives in [`test_tensor_memory.rs`](../tests/test_tensor_memory.rs) and the Candle correctness tests.
+The former diagnostic module has been removed; retained coverage lives in the [Candle correctness tests](../src/backends/candle.rs), [API tests](../tests/test_api.rs), and [pretrained GPU regression](../tests/test_gpu_inference.rs). This cleanup changes test organization without changing serving behavior. Existing memory coverage lives in [`test_tensor_memory.rs`](../tests/test_tensor_memory.rs) and the Candle correctness tests.
 
 Use these results to update the [improvement plan](continuous_batching_and_kv_cache.md#5-implementation-status--active-roadmap):
 
-- Keep inference execution isolation and model-specific chat templates open. Once fixed, enable their desired-behavior tests in the normal suite.
+- Keep inference execution isolation and model-specific chat templates open. Once chat formatting is fixed, enable its desired-behavior test in the normal suite; add an execution-isolation regression when that work is implemented.
 - Preserve the passing stop and memory regressions; qualify memory safety claims by the documented estimation exclusions.
 - Evaluate a dedicated inference owner per device with bounded request queues and shared batching. Removing the mutex alone does not establish GPU throughput gains.
 - Repeat measurements under the actual multi-thread server and network load before claiming frozen health probes, lost connections, or a production latency bound.
 - Validate memory-pressure behavior on supported hardware without treating driver OOM, recoverable backend errors, and process termination as equivalent outcomes.
+
+## Cleanup verification (2026-10-16)
+
+The cleanup removed `src/backends/production_reproductions.rs`, moved its two enabled stop tests into Candle correctness tests, and moved its ignored chat-template test into API coverage. The manual health-latency and contention probes were removed; historical findings remain above.
+
+Executed the exact retained-regression commands listed above:
+
+- CPU Candle correctness tests: **9 passed**, including both moved stop regressions. Both produced empty visible text with `finish_reason=stop` on the explicit `Device::Cpu` fixture.
+- API and shared-stop integration tests: **11 passed, 1 ignored** (the known chat-template gap).
+- Explicit ignored chat-template run: **1 failed as expected**. Captured prompt remained `user: Hello\nassistant: ` rather than the expected Qwen delimiters. This test remains ignored; no chat-formatting fix is claimed.
+- Pretrained Metal regression: **1 passed** in **44.70 s** with actual device `Metal(MetalDevice(DeviceId(1)))`, using the command above on the host. The initial sandboxed run panicked during Metal initialization before inference; it supplies no GPU evidence. The host run completed real pretrained forwards and all assertions.
+- `cargo fmt --all --check` and `git diff --check`: passed.
+
+For the GPU stop cases, the reference output was ` Paris. The capital of Italy is Rome. The capital of`. Stop ` Paris` returned empty output; spanning stop `. The` returned ` Paris`; an incomplete longer stop preserved the reference output through the 12-token limit. Both JSON and SSE agreed. Prefix comparisons, EOS suppression, shared-worker consistency, cancellation, reservation rejection/recovery, and injected-error cleanup also passed in the retained GPU test.
+
+Local artifact identity (SHA-256):
+
+```text
+f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b  models/Qwen3-0.6B/model.safetensors
+660db3b73d788119c04535e48cf9be5f55bc3100841a718637ae695b442f27dd  models/Qwen3-0.6B/config.json
+aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4  models/Qwen3-0.6B/tokenizer.json
+```
+
+Sampling settings and prompts are specified with the commands above. Limitations: no CUDA run, no new production-network latency measurements, and no driver-level OOM claim. The pretrained test checks existing serving behavior; it does not resolve the ignored chat-template gap or revalidate the deleted timing probes.

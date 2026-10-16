@@ -36,6 +36,7 @@ pub fn create_app(state: AppState) -> Router {
         .route("/", get(dashboard_handler))
         .route("/dashboard", get(dashboard_handler))
         .route("/health", get(health_handler))
+        .route("/ready", get(readiness_handler))
         .route("/v1/models", get(models_handler))
         .route("/v1/completions", post(completions_handler))
         .route("/v1/chat/completions", post(chat_completions_handler))
@@ -97,6 +98,18 @@ async fn health_handler(State(state): State<AppState>) -> Json<serde_json::Value
         "device": state.settings.device,
         "workers": state.router.workers().len(),
     }))
+}
+
+async fn readiness_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let ready = state.router.choose_worker().is_ok();
+    (
+        if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        Json(json!({"ready": ready})),
+    )
 }
 
 async fn models_handler(State(state): State<AppState>) -> Json<ModelListResponse> {
@@ -386,7 +399,7 @@ async fn status_handler(State(state): State<AppState>) -> Json<serde_json::Value
             let m = w.scheduler.metrics();
             json!({
                 "id": w.id,
-                "healthy": true,
+                "healthy": w.scheduler.is_healthy(),
                 "queue_depth": m.queue_depth,
                 "active_count": m.active_count,
                 "avg_latency_ms": m.avg_latency_ms,
@@ -396,7 +409,7 @@ async fn status_handler(State(state): State<AppState>) -> Json<serde_json::Value
         .collect();
 
     Json(json!({
-        "status": "healthy",
+        "status": if state.router.choose_worker().is_ok() { "healthy" } else { "unavailable" },
         "engine": "rlse",
         "version": "0.2.0",
         "model": state.settings.model,
@@ -429,6 +442,16 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     let cache = state.cache.lock().stats();
 
     let mut body = String::new();
+    body.push_str("# HELP mini_ready_workers Workers with usable execution paths\n# TYPE mini_ready_workers gauge\n");
+    body.push_str(&format!(
+        "mini_ready_workers {}\n",
+        state
+            .router
+            .workers()
+            .iter()
+            .filter(|w| w.scheduler.is_healthy())
+            .count()
+    ));
     body.push_str("# HELP mini_tokens_per_second Current token generation throughput\n");
     body.push_str("# TYPE mini_tokens_per_second gauge\n");
     body.push_str(&format!("mini_tokens_per_second {}\n\n", tps));

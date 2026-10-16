@@ -1,7 +1,13 @@
 //! Explicit GPU completion gate; fails rather than falling back to CPU or skipping its body.
 #![cfg(feature = "metal")]
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use axum::{body::Body, http::Request};
 use http_body_util::BodyExt;
@@ -23,6 +29,62 @@ use tower::ServiceExt;
 
 const MODEL: &str = "models/Qwen3-0.6B";
 const PROMPT: &str = "The capital of France is";
+
+// Inject a returned error only after a successful real-model GPU forward.
+// This tests serving cleanup and quarantine, not driver OOM/recovery.
+struct FaultAfterForward {
+    model: Arc<CandleBackend>,
+    remaining: AtomicUsize,
+}
+#[async_trait::async_trait]
+impl ModelBackend for FaultAfterForward {
+    fn name(&self) -> &str {
+        self.model.name()
+    }
+    fn context_length(&self) -> Option<usize> {
+        self.model.context_length()
+    }
+    fn is_healthy(&self) -> bool {
+        self.model.is_healthy()
+    }
+    fn mark_unhealthy(&self) {
+        self.model.mark_unhealthy();
+    }
+    async fn init_sequence(
+        &self,
+        prompt: &str,
+    ) -> Result<Vec<u32>, rlse::core::errors::EngineError> {
+        self.model.init_sequence(prompt).await
+    }
+    fn reserve_sequence(
+        &self,
+        id: &RequestId,
+        prompt: usize,
+        output: usize,
+    ) -> Result<(), rlse::core::errors::EngineError> {
+        self.model.reserve_sequence(id, prompt, output)
+    }
+    fn cancel_sequence(&self, id: &RequestId) {
+        self.model.cancel_sequence(id);
+    }
+    async fn step_batch(
+        &self,
+        seqs: &mut [rlse::core::types::ActiveSequence],
+    ) -> Result<Vec<rlse::backends::StepToken>, rlse::core::errors::EngineError> {
+        let tokens = self.model.step_batch(seqs).await?;
+        if self
+            .remaining
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .ok()
+            == Some(1)
+        {
+            return Err(rlse::core::errors::EngineError::BackendError(
+                "injected failure after real GPU forward".into(),
+            ));
+        }
+        Ok(tokens)
+    }
+}
 
 struct Output {
     text: String,
@@ -123,6 +185,10 @@ async fn pretrained_gpu_memory_prefix_stops_and_workers() {
     );
     model.try_set_prefix_cache(prefix.clone()).unwrap();
     let model = Arc::new(model);
+    let fault = Arc::new(FaultAfterForward {
+        model: model.clone(),
+        remaining: AtomicUsize::new(0),
+    });
     let cache = create_shared_cache(1024, 16);
     let workers: Vec<_> = (0..2)
         .map(|_| {
@@ -131,7 +197,7 @@ async fn pretrained_gpu_memory_prefix_stops_and_workers() {
                 32,
                 cache.clone(),
                 prefix.clone(),
-                model.clone(),
+                fault.clone(),
             ))
         })
         .collect();
@@ -281,6 +347,7 @@ async fn pretrained_gpu_memory_prefix_stops_and_workers() {
     println!("PASS: cancellation releases active tensor reservations and logical KV blocks");
 
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -309,6 +376,62 @@ async fn pretrained_gpu_memory_prefix_stops_and_workers() {
     let recovered = generate(&workers[0], PROMPT, 12).await;
     assert_eq!(recovered.text, plain.text);
     assert_eq!(cache.lock().allocated_count(), 0);
+    assert!(workers.iter().all(|w| w.is_healthy()));
+    fault.remaining.store(2, Ordering::SeqCst);
+    let response = app.clone().oneshot(Request::builder().method("POST").uri("/v1/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({"model":MODEL, "prompt":PROMPT, "temperature":0, "max_tokens":128, "stream":true}).to_string())).unwrap()).await.unwrap();
+    assert!(response.status().is_success());
+    let body = tokio::time::timeout(Duration::from_secs(30), response.into_body().collect())
+        .await
+        .unwrap()
+        .unwrap()
+        .to_bytes();
+    let text = std::str::from_utf8(&body).unwrap();
+    assert!(
+        text.contains("injected failure after real GPU forward"),
+        "{text}"
+    );
+    assert!(
+        text.contains(" Paris"),
+        "the first real GPU token must precede the error: {text}"
+    );
+    assert!(!text.contains("[DONE]"));
+    assert!(!model.is_healthy());
+    assert!(workers.iter().all(|w| !w.is_healthy()));
+    assert_eq!(budget.stats().active_kv_reserved_bytes, 0);
+    assert_eq!(budget.stats().execution_reserved_bytes, 0);
+    assert_eq!(budget.stats().prefix_retained_bytes, 0);
+    assert_eq!(cache.lock().allocated_count(), 0);
+    let ready = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ready.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    let rejected = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"model":MODEL, "prompt":PROMPT, "max_tokens":12}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rejected.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    println!("PASS: injected returned failure after real Metal prefill/decode emits SSE error, quarantines both shared workers, clears active/prefix reservations, makes readiness and subsequent admission return 503; no automatic retry");
     for worker in &workers {
         worker.shutdown();
     }

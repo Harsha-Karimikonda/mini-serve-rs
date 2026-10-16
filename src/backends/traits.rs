@@ -15,6 +15,12 @@ pub struct StepToken {
 #[async_trait]
 pub trait ModelBackend: Send + Sync {
     fn name(&self) -> &str;
+    /// Shared execution health. Stateful backends must publish quarantine to all workers.
+    fn is_healthy(&self) -> bool {
+        true
+    }
+    /// Permanently quarantine execution after a returned backend failure. No automatic retry.
+    fn mark_unhealthy(&self) {}
     /// Maximum supported prompt plus output length, when the model has a context limit.
     fn context_length(&self) -> Option<usize> {
         None

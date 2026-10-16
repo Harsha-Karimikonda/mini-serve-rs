@@ -44,25 +44,11 @@ impl Router {
     }
 
     pub fn choose_worker(&self) -> Result<&WorkerHandle, EngineError> {
-        if self.workers.is_empty() {
-            return Err(EngineError::NoHealthyWorkers(
-                "No worker instances registered in router".to_string(),
-            ));
-        }
-
-        // Find worker with lowest expected delay score: (queue + active + 1) * latency
-        let mut best_worker = &self.workers[0];
-        let mut min_score = best_worker.score();
-
-        for worker in &self.workers[1..] {
-            let score = worker.score();
-            if score < min_score {
-                min_score = score;
-                best_worker = worker;
-            }
-        }
-
-        Ok(best_worker)
+        self.workers
+            .iter()
+            .filter(|worker| worker.scheduler.is_healthy())
+            .min_by(|a, b| a.score().total_cmp(&b.score()))
+            .ok_or_else(|| EngineError::NoHealthyWorkers("No ready execution paths".into()))
     }
 
     pub async fn submit(

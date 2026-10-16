@@ -8,8 +8,10 @@ use tower::ServiceExt;
 
 use rlse::api::{create_app, AppState};
 use rlse::backends::mock::MockBackend;
+use rlse::backends::{ModelBackend, StepToken};
 use rlse::cache::{create_shared_cache, create_shared_prefix_cache};
 use rlse::core::config::Settings;
+use rlse::core::{errors::EngineError, types::ActiveSequence};
 use rlse::routing::router::{Router, WorkerHandle};
 use rlse::scheduler::scheduler::Scheduler;
 use rlse::telemetry::create_telemetry;
@@ -379,4 +381,74 @@ async fn tensor_memory_telemetry_is_separate_from_logical_blocks() {
     }
     assert!(text.contains("mini_tensor_memory_rejections_total 0\n"));
     assert!(text.contains("mini_prefix_tensor_evictions_total 0\n"));
+}
+
+struct CapturePrompt(parking_lot::Mutex<Option<String>>);
+
+#[async_trait::async_trait]
+impl ModelBackend for CapturePrompt {
+    fn name(&self) -> &str {
+        "capture"
+    }
+    async fn init_sequence(&self, prompt: &str) -> Result<Vec<u32>, EngineError> {
+        *self.0.lock() = Some(prompt.into());
+        Ok(vec![1])
+    }
+    async fn step_batch(
+        &self,
+        sequences: &mut [ActiveSequence],
+    ) -> Result<Vec<StepToken>, EngineError> {
+        Ok(sequences
+            .iter()
+            .map(|_| StepToken {
+                token_id: 1,
+                text: "ok".into(),
+                is_eos: true,
+            })
+            .collect())
+    }
+}
+
+#[tokio::test]
+#[ignore = "known gap: route does not apply the Qwen-style chat template"]
+async fn chat_route_applies_role_delimiters() {
+    let backend = Arc::new(CapturePrompt(parking_lot::Mutex::new(None)));
+    let cache = create_shared_cache(256, 16);
+    let prefix_cache = create_shared_prefix_cache(16, 128);
+    let scheduler = Arc::new(Scheduler::new(
+        4,
+        32,
+        cache.clone(),
+        prefix_cache.clone(),
+        backend.clone(),
+    ));
+    let router = Arc::new(Router::new(vec![WorkerHandle::new(
+        "chat-template-test",
+        scheduler.clone(),
+    )]));
+    let app = create_app(AppState {
+        router,
+        cache,
+        prefix_cache,
+        telemetry: create_telemetry(),
+        settings: Settings::default(),
+    });
+    let task = scheduler.start_loop();
+    let response = app.oneshot(Request::builder()
+        .method("POST").uri("/v1/chat/completions").header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({"model":"capture", "messages":[{"role":"user", "content":"Hello"}], "max_tokens":1}).to_string()))
+        .unwrap()).await.unwrap();
+    let status = response.status();
+    let _ = response.into_body().collect().await.unwrap();
+    scheduler.shutdown();
+    task.await.unwrap();
+    assert!(status.is_success());
+    let actual = backend.0.lock().clone().unwrap();
+    eprintln!("C: chat prompt handed to backend={actual:?}");
+    // This checks route formatting only, not pretrained response quality or
+    // the additional thinking-mode options supported by some Qwen templates.
+    assert_eq!(
+        actual,
+        "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n"
+    );
 }

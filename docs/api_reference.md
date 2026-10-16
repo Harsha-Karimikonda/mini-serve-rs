@@ -222,3 +222,16 @@ The byte fields have corresponding `mini_tensor_memory_*_bytes` Prometheus
 gauges; rejection and eviction counters are `mini_tensor_memory_rejections_total`
 and `mini_prefix_tensor_evictions_total`. These are conservative reservations,
 with model weights excluded. See [memory accounting](tensor_memory.md).
+
+
+### Execution readiness and failures
+
+`GET /health` reports HTTP liveness. `GET /ready` returns HTTP 200 with
+`{"ready":true}` when an eligible execution path exists, or HTTP 503 with
+`{"ready":false}` otherwise. Returned Candle execution/allocation failures
+quarantine every worker sharing that backend until process restart. Already
+admitted requests receive explicit JSON/SSE errors; subsequent admission returns
+503. Tensor reservation pressure alone leaves the backend eligible. Worker
+quarantine is reflected in `/api/status` and `mini_ready_workers` in `/metrics`.
+See [allocation and execution failures](device_failures.md) for cleanup, recovery,
+custom backend hooks, and the limits of readiness and device verification.
