@@ -3,9 +3,11 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 pub fn init_logging(log_level: &str) {
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(format!("mini_serve={},tower_http=info", log_level)));
+        .unwrap_or_else(|_| EnvFilter::new(format!("rlse={},tower_http=info", log_level)));
 
-    let format = env::var("MINI_LOG_FORMAT").unwrap_or_else(|_| "text".to_string());
+    let format = env::var("RLSE_LOG_FORMAT")
+        .or_else(|_| env::var("MINI_LOG_FORMAT"))
+        .unwrap_or_else(|_| "text".to_string());
 
     if format.to_lowercase() == "json" {
         tracing_subscriber::registry()

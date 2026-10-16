@@ -1,5 +1,5 @@
-use mini_serve::cache::KVCache;
-use mini_serve::core::errors::EngineError;
+use rlse::cache::KVCache;
+use rlse::core::errors::EngineError;
 
 #[test]
 fn test_cache_allocate_and_release() {

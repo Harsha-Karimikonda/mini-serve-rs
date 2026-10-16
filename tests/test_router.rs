@@ -1,8 +1,8 @@
-use mini_serve::backends::mock::MockBackend;
-use mini_serve::cache::{create_shared_cache, create_shared_prefix_cache};
-use mini_serve::core::types::{RequestId, SamplingParams};
-use mini_serve::routing::router::{Router, WorkerHandle};
-use mini_serve::scheduler::scheduler::Scheduler;
+use rlse::backends::mock::MockBackend;
+use rlse::cache::{create_shared_cache, create_shared_prefix_cache};
+use rlse::core::types::{RequestId, SamplingParams};
+use rlse::routing::router::{Router, WorkerHandle};
+use rlse::scheduler::scheduler::Scheduler;
 use std::sync::Arc;
 
 #[tokio::test]

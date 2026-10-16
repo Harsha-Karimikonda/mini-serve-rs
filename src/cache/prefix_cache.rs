@@ -1,7 +1,13 @@
+use crate::cache::tensor_memory::{
+    MemoryCharge, MemoryReservation, TensorMemoryBudget, DEFAULT_EXECUTION_HEADROOM,
+    DEFAULT_TENSOR_MEMORY_BUDGET,
+};
+use crate::core::errors::EngineError;
 use candle_core::Tensor;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 use crate::core::constants::{DEFAULT_BLOCK_SIZE, DEFAULT_PREFIX_CACHE_MAX_CHUNKS};
 
@@ -19,6 +25,28 @@ pub struct CachedChunk {
     pub tokens: Vec<u32>,
     pub kv_layers: Option<Vec<LayerKVPair>>,
     pub last_logits: Option<Tensor>,
+    reservation: Option<Arc<MemoryReservation>>,
+}
+
+/// A borrowed snapshot keeps its storage charged even after cache eviction.
+#[derive(Debug, Clone)]
+pub struct PrefixSnapshot {
+    matched_tokens: usize,
+    layers: Vec<LayerKVPair>,
+    logits: Option<Tensor>,
+    _reservation: Arc<MemoryReservation>,
+}
+
+impl PrefixSnapshot {
+    pub fn matched_tokens(&self) -> usize {
+        self.matched_tokens
+    }
+    pub fn layers(&self) -> &[LayerKVPair] {
+        &self.layers
+    }
+    pub fn logits(&self) -> Option<&Tensor> {
+        self.logits.as_ref()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -36,10 +64,25 @@ pub struct PrefixCache {
     hits: usize,
     misses: usize,
     tokens_saved: usize,
+    memory: Arc<TensorMemoryBudget>,
+    tensor_evictions: usize,
 }
 
 impl PrefixCache {
     pub fn new(chunk_size: usize, max_chunks: usize) -> Self {
+        Self::with_memory_budget(
+            chunk_size,
+            max_chunks,
+            TensorMemoryBudget::new(DEFAULT_TENSOR_MEMORY_BUDGET, DEFAULT_EXECUTION_HEADROOM)
+                .expect("valid defaults"),
+        )
+    }
+
+    pub fn with_memory_budget(
+        chunk_size: usize,
+        max_chunks: usize,
+        memory: Arc<TensorMemoryBudget>,
+    ) -> Self {
         Self {
             chunk_size,
             max_chunks,
@@ -48,6 +91,8 @@ impl PrefixCache {
             hits: 0,
             misses: 0,
             tokens_saved: 0,
+            memory,
+            tensor_evictions: 0,
         }
     }
 
@@ -116,17 +161,14 @@ impl PrefixCache {
         }
     }
 
-    pub fn lookup_kv(
-        &mut self,
-        tokens: &[u32],
-    ) -> Option<(usize, Vec<LayerKVPair>, Option<Tensor>)> {
+    pub fn lookup_kv(&mut self, tokens: &[u32]) -> Option<PrefixSnapshot> {
         let chunk_pairs = Self::compute_chunk_hashes(tokens, self.chunk_size);
         if chunk_pairs.is_empty() {
             self.misses += 1;
             return None;
         }
 
-        let mut longest_match: Option<(usize, Vec<LayerKVPair>, Option<Tensor>)> = None;
+        let mut longest_match = None;
 
         for (i, (hash, _)) in chunk_pairs.iter().enumerate() {
             if let Some(chunk) = self.chunks.get(hash) {
@@ -137,21 +179,30 @@ impl PrefixCache {
                     } else {
                         None
                     };
-                    longest_match = Some((token_count, kv.clone(), logits));
+                    longest_match = Some(PrefixSnapshot {
+                        matched_tokens: token_count,
+                        layers: kv.clone(),
+                        logits,
+                        _reservation: chunk
+                            .reservation
+                            .as_ref()
+                            .expect("KV storage is charged")
+                            .clone(),
+                    });
                 }
                 // Refresh LRU
                 if let Some(pos) = self.lru_order.iter().position(|h| h == hash) {
                     self.lru_order.remove(pos);
                 }
                 self.lru_order.push_back(hash.clone());
-            } else {
-                break;
             }
+            // Each chained key authenticates its complete prefix. Intermediate
+            // snapshots may have been evicted while a longer one remains.
         }
 
-        if let Some((matched_tokens, _, _)) = &longest_match {
+        if let Some(snapshot) = &longest_match {
             self.hits += 1;
-            self.tokens_saved += *matched_tokens;
+            self.tokens_saved += snapshot.matched_tokens;
         } else {
             self.misses += 1;
         }
@@ -162,8 +213,53 @@ impl PrefixCache {
     pub fn insert(&mut self, tokens: &[u32]) {
         let chunk_pairs = Self::compute_chunk_hashes(tokens, self.chunk_size);
         for (hash, chunk_tokens) in chunk_pairs {
-            self.insert_chunk(hash, chunk_tokens, None, None);
+            self.insert_chunk(hash, chunk_tokens);
         }
+    }
+
+    pub fn memory_budget(&self) -> Arc<TensorMemoryBudget> {
+        self.memory.clone()
+    }
+
+    pub fn tensor_evictions(&self) -> usize {
+        self.tensor_evictions
+    }
+
+    fn evict_oldest(&mut self) -> bool {
+        if let Some(hash) = self.lru_order.pop_front() {
+            if self
+                .chunks
+                .remove(&hash)
+                .is_some_and(|c| c.kv_layers.is_some())
+            {
+                self.tensor_evictions += 1;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Admission and cache insertion share a budget across all workers.
+    pub fn reserve_memory(
+        &mut self,
+        charge: MemoryCharge,
+    ) -> Result<Arc<MemoryReservation>, EngineError> {
+        loop {
+            if let Some(reservation) = self.memory.try_reserve(charge) {
+                return Ok(reservation);
+            }
+            if !self.evict_oldest() {
+                self.memory.record_rejection();
+                return Err(EngineError::CachePressure(
+                    "Tensor memory budget exhausted".into(),
+                ));
+            }
+        }
+    }
+
+    pub fn clear(&mut self) {
+        while self.evict_oldest() {}
     }
 
     pub fn insert_kv(
@@ -172,75 +268,114 @@ impl PrefixCache {
         full_kv_layers: &[LayerKVPair],
         last_logits: Option<&Tensor>,
     ) {
+        if self.max_chunks == 0 || full_kv_layers.is_empty() {
+            return;
+        }
         let chunk_pairs = Self::compute_chunk_hashes(tokens, self.chunk_size);
-        let num_pairs = chunk_pairs.len();
         for (i, (hash, chunk_tokens)) in chunk_pairs.into_iter().enumerate() {
             let chunk_end = (i + 1) * self.chunk_size;
-
-            let mut sliced_layers = Vec::with_capacity(full_kv_layers.len());
-            let mut slice_ok = true;
-            for layer in full_kv_layers {
-                let k_len = layer.k.dim(2).unwrap_or(0);
-                let v_len = layer.v.dim(2).unwrap_or(0);
-                if k_len >= chunk_end && v_len >= chunk_end {
-                    if let (Ok(k), Ok(v)) = (
-                        layer.k.narrow(2, 0, chunk_end).and_then(|t| t.contiguous()),
-                        layer.v.narrow(2, 0, chunk_end).and_then(|t| t.contiguous()),
-                    ) {
-                        sliced_layers.push(LayerKVPair { k, v });
-                    } else {
-                        slice_ok = false;
-                        break;
-                    }
-                } else {
-                    slice_ok = false;
-                    break;
-                }
+            let logits = if chunk_end == tokens.len() {
+                last_logits
+            } else {
+                None
+            };
+            if self.chunks.get(&hash).is_some_and(|chunk| {
+                chunk.kv_layers.is_some() && (logits.is_none() || chunk.last_logits.is_some())
+            }) {
+                continue;
             }
-
-            if slice_ok && sliced_layers.len() == full_kv_layers.len() {
-                let chunk_logits = if i + 1 == num_pairs && chunk_end == tokens.len() {
-                    last_logits.cloned()
-                } else {
-                    None
-                };
-                self.insert_chunk(hash, chunk_tokens, Some(sliced_layers), chunk_logits);
+            // Reserve before making owned copies. A narrow/contiguous view can
+            // retain a much larger active KV buffer, including for one KV head.
+            let bytes = (|| -> Option<usize> {
+                let mut bytes = 0usize;
+                for layer in full_kv_layers {
+                    for t in [&layer.k, &layer.v] {
+                        let (batch, heads, len, dim) = t.dims4().ok()?;
+                        if len < chunk_end {
+                            return None;
+                        }
+                        let size = batch
+                            .checked_mul(heads)?
+                            .checked_mul(chunk_end)?
+                            .checked_mul(dim)?
+                            .checked_mul(t.dtype().size_in_bytes())?;
+                        bytes = bytes.checked_add(size)?;
+                    }
+                }
+                if let Some(t) = logits {
+                    bytes = bytes
+                        .checked_add(t.elem_count().checked_mul(t.dtype().size_in_bytes())?)?;
+                }
+                Some(bytes)
+            })();
+            let Some(bytes) = bytes else {
+                continue;
+            };
+            let Ok(reservation) = self.reserve_memory(MemoryCharge {
+                prefix: bytes,
+                ..MemoryCharge::default()
+            }) else {
+                continue;
+            };
+            let copied = (|| -> candle_core::Result<_> {
+                let mut layers = Vec::with_capacity(full_kv_layers.len());
+                for layer in full_kv_layers {
+                    layers.push(LayerKVPair {
+                        k: layer
+                            .k
+                            .narrow(2, 0, chunk_end)?
+                            .force_contiguous()?
+                            .detach(),
+                        v: layer
+                            .v
+                            .narrow(2, 0, chunk_end)?
+                            .force_contiguous()?
+                            .detach(),
+                    });
+                }
+                let logits = logits
+                    .map(|t| t.force_contiguous().map(|t| t.detach()))
+                    .transpose()?;
+                Ok((layers, logits))
+            })();
+            if let Ok((layers, logits)) = copied {
+                // Replace an older metadata-only entry or snapshot lacking logits.
+                self.chunks.remove(&hash);
+                self.lru_order.retain(|h| h != &hash);
+                while self.chunks.len() >= self.max_chunks {
+                    self.evict_oldest();
+                }
+                self.chunks.insert(
+                    hash.clone(),
+                    CachedChunk {
+                        tokens: chunk_tokens,
+                        kv_layers: Some(layers),
+                        last_logits: logits,
+                        reservation: Some(reservation),
+                    },
+                );
+                self.lru_order.push_back(hash);
             }
         }
     }
 
-    fn insert_chunk(
-        &mut self,
-        hash: String,
-        tokens: Vec<u32>,
-        kv: Option<Vec<LayerKVPair>>,
-        logits: Option<Tensor>,
-    ) {
-        if !self.chunks.contains_key(&hash) {
-            while self.chunks.len() >= self.max_chunks && !self.lru_order.is_empty() {
-                if let Some(evicted) = self.lru_order.pop_front() {
-                    self.chunks.remove(&evicted);
-                }
-            }
-            self.chunks.insert(
-                hash.clone(),
-                CachedChunk {
-                    tokens,
-                    kv_layers: kv,
-                    last_logits: logits,
-                },
-            );
-            self.lru_order.push_back(hash);
-        } else if kv.is_some() {
-            if let Some(chunk) = self.chunks.get_mut(&hash) {
-                if chunk.kv_layers.is_none() {
-                    chunk.kv_layers = kv;
-                }
-                if chunk.last_logits.is_none() && logits.is_some() {
-                    chunk.last_logits = logits;
-                }
-            }
+    fn insert_chunk(&mut self, hash: String, tokens: Vec<u32>) {
+        if self.max_chunks == 0 || self.chunks.contains_key(&hash) {
+            return;
         }
+        while self.chunks.len() >= self.max_chunks {
+            self.evict_oldest();
+        }
+        self.chunks.insert(
+            hash.clone(),
+            CachedChunk {
+                tokens,
+                kv_layers: None,
+                last_logits: None,
+                reservation: None,
+            },
+        );
+        self.lru_order.push_back(hash);
     }
 
     pub fn stats(&self) -> (usize, usize, usize) {

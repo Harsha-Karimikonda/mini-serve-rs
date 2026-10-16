@@ -13,10 +13,12 @@ use crate::core::types::{RequestId, SamplingParams};
 use crate::scheduler::sequence::{ActiveSequence, TokenEvent};
 
 struct QueueItem {
+    prompt_tokens: Vec<u32>,
     request_id: RequestId,
     prompt: String,
     sampling: SamplingParams,
     tx: mpsc::Sender<TokenEvent>,
+    terminal_permit: mpsc::OwnedPermit<TokenEvent>,
     enqueued_at: Instant,
 }
 
@@ -94,6 +96,57 @@ impl Scheduler {
         prompt: String,
         sampling: SamplingParams,
     ) -> Result<mpsc::Receiver<TokenEvent>, EngineError> {
+        sampling.validate()?;
+        if prompt.trim().is_empty() {
+            return Err(EngineError::InvalidRequest("Prompt cannot be empty".into()));
+        }
+        if self.max_batch_size == 0 || self.max_waiting_requests == 0 {
+            return Err(EngineError::InvalidRequest(
+                "Scheduler batch and queue sizes must be greater than zero".into(),
+            ));
+        }
+        // Tokenization must not allocate request-scoped execution state. Validate
+        // the complete request before queuing or allocating any KV blocks.
+        let prompt_tokens = self.backend.init_sequence(&prompt).await?;
+        if prompt_tokens.is_empty() {
+            return Err(EngineError::InvalidRequest(
+                "Prompt must encode at least one token".into(),
+            ));
+        }
+        let total_tokens = prompt_tokens
+            .len()
+            .checked_add(sampling.max_tokens)
+            .ok_or_else(|| {
+                EngineError::TokenLimitExceeded("Prompt plus max_tokens overflows usize".into())
+            })?;
+        if let Some(limit) = self.backend.context_length() {
+            if total_tokens > limit {
+                return Err(EngineError::TokenLimitExceeded(format!(
+                    "Prompt ({} tokens) plus max_tokens={} exceeds model context {limit}",
+                    prompt_tokens.len(),
+                    sampling.max_tokens
+                )));
+            }
+        }
+        {
+            let cache = self.cache.lock();
+            if cache.block_size() == 0 || cache.total_blocks() == 0 {
+                return Err(EngineError::InvalidRequest(
+                    "KV block size and capacity must be greater than zero".into(),
+                ));
+            }
+            let capacity = cache
+                .total_blocks()
+                .checked_mul(cache.block_size())
+                .ok_or_else(|| {
+                    EngineError::InvalidRequest("KV token capacity overflows usize".into())
+                })?;
+            if total_tokens > capacity {
+                return Err(EngineError::CachePressure(format!(
+                    "Prompt plus max_tokens requires {total_tokens} tokens, exceeding logical KV capacity {capacity}"
+                )));
+            }
+        }
         let mut queue = self.queue.lock();
         if queue.len() >= self.max_waiting_requests {
             return Err(EngineError::AdmissionError(format!(
@@ -102,22 +155,19 @@ impl Scheduler {
             )));
         }
 
-        // Fast-fail check against total cache capacity
-        let needed_blocks = self.cache.lock().blocks_needed(sampling.max_tokens);
-        let total_blocks = self.cache.lock().total_blocks();
-        if needed_blocks > total_blocks {
-            return Err(EngineError::CachePressure(format!(
-                "Requested {} blocks for max_tokens={}, which exceeds total cluster cache size {}",
-                needed_blocks, sampling.max_tokens, total_blocks
-            )));
-        }
-
-        let (tx, rx) = mpsc::channel(64);
+        // Keep 64 token slots plus one slot reserved for completion or error.
+        let (tx, rx) = mpsc::channel(65);
+        let terminal_permit = tx
+            .clone()
+            .try_reserve_owned()
+            .expect("new channel has capacity");
         queue.push_back(QueueItem {
+            prompt_tokens,
             request_id,
             prompt,
             sampling,
             tx,
+            terminal_permit,
             enqueued_at: Instant::now(),
         });
         drop(queue);
@@ -155,13 +205,19 @@ impl Scheduler {
                             continue;
                         }
 
-                        let prompt_tokens = match self.backend.init_sequence(&item.prompt).await {
-                            Ok(tokens) => tokens,
-                            Err(err) => {
-                                let _ = item.tx.send(TokenEvent::Error(err.to_string())).await;
-                                continue;
-                            }
-                        };
+                        let prompt_tokens = item.prompt_tokens;
+
+                        if let Err(err) = self.backend.reserve_sequence(
+                            &item.request_id,
+                            prompt_tokens.len(),
+                            item.sampling.max_tokens,
+                        ) {
+                            // Backends may have partially prepared request state.
+                            self.backend.cancel_sequence(&item.request_id);
+                            item.terminal_permit
+                                .send(TokenEvent::Error(err.to_string()));
+                            continue;
+                        }
 
                         // Check prefix cache for reuse
                         {
@@ -190,14 +246,17 @@ impl Scheduler {
                                     item.sampling,
                                     item.tx,
                                 );
+                                seq.terminal_permit = Some(item.terminal_permit);
                                 seq.created_at = item.enqueued_at;
                                 seq.prompt_tokens = prompt_tokens;
                                 seq.kv_blocks = blocks;
                                 active.push(seq);
                             }
                             Err(err) => {
+                                self.backend.cancel_sequence(&item.request_id);
                                 warn!("Cache allocation failed for {}: {}", item.request_id, err);
-                                let _ = item.tx.send(TokenEvent::Error(err.to_string())).await;
+                                item.terminal_permit
+                                    .send(TokenEvent::Error(err.to_string()));
                             }
                         }
                     }
@@ -236,13 +295,46 @@ impl Scheduler {
                 continue;
             }
 
+            // Reserve logical space before executing the next step. Contending
+            // requests can exhaust the shared pool after initial admission.
+            let mut i = 0;
+            while i < active.len() {
+                let seq = &mut active[i];
+                let allocation = {
+                    let mut cache = self.cache.lock();
+                    let next_len = seq.prompt_tokens.len() + seq.output_tokens.len() + 1;
+                    if cache.blocks_needed(next_len) > seq.kv_blocks.len() {
+                        cache.allocate_block(&seq.request_id.0).map(Some)
+                    } else {
+                        Ok(None)
+                    }
+                };
+                match allocation {
+                    Ok(Some(block)) => {
+                        seq.kv_blocks.push(block);
+                        i += 1;
+                    }
+                    Ok(None) => i += 1,
+                    Err(err) => {
+                        let mut failed = active.swap_remove(i);
+                        failed.send_terminal(TokenEvent::Error(err.to_string()));
+                        self.backend.cancel_sequence(&failed.request_id);
+                        self.cache.lock().release(&failed.request_id.0);
+                    }
+                }
+            }
+            self.active_count.store(active.len(), Ordering::Relaxed);
+            if active.is_empty() {
+                continue;
+            }
+
             // Step Batch Forward Pass
             let step_tokens: Vec<StepToken> = match self.backend.step_batch(&mut active).await {
                 Ok(toks) => toks,
                 Err(err) => {
                     warn!("Backend step_batch error: {}", err);
-                    for seq in active.drain(..) {
-                        let _ = seq.tx.try_send(TokenEvent::Error(err.to_string()));
+                    for mut seq in active.drain(..) {
+                        seq.send_terminal(TokenEvent::Error(err.to_string()));
                         self.backend.cancel_sequence(&seq.request_id);
                         self.cache.lock().release(&seq.request_id.0);
                     }
@@ -261,25 +353,15 @@ impl Scheduler {
                 seq.output_tokens.push(step.token_id);
                 seq.output_text.push_str(&step.text);
 
-                // Dynamically allocate a new KV block if generation crosses block boundary
-                let total_tokens_now = seq.prompt_tokens.len() + seq.output_tokens.len();
-                let block_size = self.cache.lock().block_size();
-                let current_capacity = seq.kv_blocks.len() * block_size;
-                if total_tokens_now > current_capacity {
-                    match self.cache.lock().allocate_block(&seq.request_id.0) {
-                        Ok(new_block) => {
-                            seq.kv_blocks.push(new_block);
-                        }
-                        Err(err) => {
-                            warn!("KV cache exhausted for request {}: {}", seq.request_id, err);
-                            seq.is_finished = true;
-                            seq.finish_reason = Some("length".to_string());
-                        }
-                    }
+                let hit_max = seq.output_tokens.len() >= seq.sampling.max_tokens;
+                let (mut visible_text, matched_stop) = seq.stop_matcher.push(&step.text);
+                if !matched_stop && (step.is_eos || hit_max) {
+                    visible_text.push_str(&seq.stop_matcher.finish());
                 }
 
-                // Stream token to client without blocking batch progress
-                match seq.tx.try_send(TokenEvent::Token(step.text)) {
+                // Keep one event per generated token, including empty decoded
+                // fragments. Usage counts generated IDs, not visible strings.
+                match seq.tx.try_send(TokenEvent::Token(visible_text)) {
                     Ok(_) => {}
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                         warn!(
@@ -287,7 +369,8 @@ impl Scheduler {
                             seq.request_id
                         );
                         seq.is_finished = true;
-                        seq.finish_reason = Some("error".to_string());
+                        seq.terminal_error =
+                            Some("Client too slow: token channel capacity exceeded".to_string());
                     }
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                         seq.is_finished = true;
@@ -295,16 +378,13 @@ impl Scheduler {
                     }
                 }
 
-                if !seq.is_finished {
-                    let hit_max = seq.output_tokens.len() >= seq.sampling.max_tokens;
-                    if step.is_eos || hit_max {
-                        seq.is_finished = true;
-                        seq.finish_reason = Some(if step.is_eos {
-                            "stop".to_string()
-                        } else {
-                            "length".to_string()
-                        });
-                    }
+                if !seq.is_finished && (step.is_eos || matched_stop || hit_max) {
+                    seq.is_finished = true;
+                    seq.finish_reason = Some(if step.is_eos || matched_stop {
+                        "stop".to_string()
+                    } else {
+                        "length".to_string()
+                    });
                 }
             }
 
@@ -312,7 +392,7 @@ impl Scheduler {
             let mut j = 0;
             while j < active.len() {
                 if active[j].is_finished || active[j].is_cancelled() {
-                    let finished = active.swap_remove(j);
+                    let mut finished = active.swap_remove(j);
 
                     if finished.is_finished {
                         let usage = finished.usage();
@@ -320,10 +400,14 @@ impl Scheduler {
                             .finish_reason
                             .clone()
                             .unwrap_or_else(|| "stop".to_string());
-                        let _ = finished.tx.try_send(TokenEvent::Done {
-                            usage,
-                            finish_reason,
-                        });
+                        let terminal = match finished.terminal_error.take() {
+                            Some(error) => TokenEvent::Error(error),
+                            None => TokenEvent::Done {
+                                usage,
+                                finish_reason,
+                            },
+                        };
+                        finished.send_terminal(terminal);
 
                         // Insert prompt into prefix cache for future requests
                         self.prefix_cache.lock().insert(&finished.prompt_tokens);

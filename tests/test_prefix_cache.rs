@@ -1,4 +1,4 @@
-use mini_serve::cache::PrefixCache;
+use rlse::cache::PrefixCache;
 
 #[test]
 fn test_prefix_chunk_hashing() {
@@ -55,7 +55,7 @@ fn test_prefix_cache_lru_eviction() {
 #[test]
 fn test_prefix_cache_insert_and_lookup_kv() -> candle_core::Result<()> {
     use candle_core::{Device, Tensor};
-    use mini_serve::cache::prefix_cache::LayerKVPair;
+    use rlse::cache::prefix_cache::LayerKVPair;
 
     let dev = Device::Cpu;
     let mut cache = PrefixCache::new(16, 100);
@@ -80,7 +80,8 @@ fn test_prefix_cache_insert_and_lookup_kv() -> candle_core::Result<()> {
     // Full match on same prompt
     let full_hit = cache.lookup_kv(&prompt);
     assert!(full_hit.is_some());
-    let (matched, layers, logits) = full_hit.unwrap();
+    let full = full_hit.unwrap();
+    let (matched, layers, logits) = (full.matched_tokens(), full.layers(), full.logits());
     assert_eq!(matched, 48);
     assert_eq!(layers.len(), 2);
     assert_eq!(layers[0].k.dims4()?, (1, 2, 48, 64));
@@ -91,7 +92,8 @@ fn test_prefix_cache_insert_and_lookup_kv() -> candle_core::Result<()> {
     prompt_ext.extend(vec![999, 1000, 1001]); // 35 tokens total
     let partial_hit = cache.lookup_kv(&prompt_ext);
     assert!(partial_hit.is_some());
-    let (matched, layers, logits) = partial_hit.unwrap();
+    let partial = partial_hit.unwrap();
+    let (matched, layers, logits) = (partial.matched_tokens(), partial.layers(), partial.logits());
     assert_eq!(matched, 32);
     assert_eq!(layers[0].k.dims4()?, (1, 2, 32, 64));
     assert!(logits.is_none());

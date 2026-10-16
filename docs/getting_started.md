@@ -32,7 +32,7 @@ Mini-Serve is configured using Cargo feature flags.
 cargo build --release --features metal
 ```
 The compiled self-contained binary will be created at:
-`target/release/mini-serve` (~14.0 MB).
+`target/release/rlse` (~14.0 MB).
 
 ### Standard CPU (Portable)
 ```bash
@@ -46,14 +46,14 @@ cargo build --release
 ### A. Development / Testing Mode (Mock Backend)
 The fastest way to test the API gateway, continuous batching scheduler, and dashboard is using the built-in mock backend:
 ```bash
-./target/release/mini-serve --model mock --port 8000
+./target/release/rlse --model mock --port 8000
 ```
 This simulates a 3-millisecond per-token forward pass without requiring GPU memory or model downloads.
 
 ### B. Real Hugging Face Model (Metal GPU Acceleration)
 To serve a real model (such as `Qwen/Qwen2.5-0.5B-Instruct` or `Qwen/Qwen3-0.6B`):
 ```bash
-./target/release/mini-serve \
+./target/release/rlse \
   --model Qwen/Qwen3-0.6B \
   --device metal \
   --port 8000 \
@@ -64,7 +64,7 @@ If the model weights are not found locally in `models/`, Mini-Serve will automat
 ### C. Offline / Local Directory Serving
 If you already have models downloaded on disk:
 ```bash
-./target/release/mini-serve \
+./target/release/rlse \
   --model models/Qwen3-0.6B \
   --device metal \
   --port 8000
@@ -85,8 +85,10 @@ All settings can be specified either via command-line arguments or environment v
 | `--num-workers` | `MINI_NUM_WORKERS` | `2` | Number of concurrent continuous batching worker threads. |
 | `--max-batch-size` | `MINI_MAX_BATCH_SIZE` | `8` | Maximum concurrent active sequences per worker iteration. |
 | `--max-waiting-requests` | `MINI_MAX_WAITING_REQUESTS` | `256` | Maximum queue depth before fast-failing with HTTP 429. |
-| `--kv-cache-blocks` | `MINI_KV_CACHE_BLOCKS` | `1024` | Total physical KV-cache blocks allocated in memory. |
-| `--block-size` | `MINI_BLOCK_SIZE` | `16` | Number of tokens stored per physical block. |
+| `--kv-cache-blocks` | `MINI_KV_CACHE_BLOCKS` | `1024` | Logical KV block capacity, separate from tensor bytes. |
+| `--block-size` | `MINI_BLOCK_SIZE` | `16` | Token slots per logical block. |
+| `--tensor-memory-budget-bytes` | `MINI_TENSOR_MEMORY_BUDGET_BYTES` | `8589934592` | Shared KV, prefix, and execution reservation budget; excludes weights. |
+| `--execution-headroom-bytes` | `MINI_EXECUTION_HEADROOM_BYTES` | `268435456` | Fixed additional headroom within the tensor budget. |
 | `--log-level` | `MINI_LOG_LEVEL` | `info` | Logging verbosity (`trace`, `debug`, `info`, `warn`, `error`). |
 | `--hf-token` | `HF_TOKEN` | `None` | Authentication token for Hugging Face Hub downloads. |
 
@@ -110,3 +112,5 @@ cargo clippy --features metal --all-targets -- -D warnings
 cargo fmt -- --check
 ```
 
+
+See [tensor memory reservations](tensor_memory.md) for estimation formulas, telemetry, and physical allocation limits.

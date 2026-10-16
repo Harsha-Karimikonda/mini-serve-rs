@@ -1,8 +1,9 @@
-# Mini-Serve (Rust Core) ⚡
+# RLSE ⚡
+### **R**ust **L**LM **S**erving **E**ngine
 
 A blazing-fast, fault-tolerant, high-throughput LLM inference engine and continuous batching control plane written in pure **Rust**.
 
-Inspired by production serving systems (vLLM, TGI, and Together AI), `mini-serve-rs` delivers deterministic, low-latency token streaming with **zero Python GIL contention**, **zero model weight duplication**, and a lightweight native binary footprint (**4.7 MB** core / **14.0 MB** with Metal GPU acceleration).
+Inspired by production serving systems (vLLM, TGI, and Together AI), **RLSE** delivers deterministic, low-latency token streaming with **zero Python GIL contention**, **zero model weight duplication**, and a lightweight native binary footprint (**4.7 MB** core / **14.0 MB** with Metal GPU acceleration).
 
 ---
 
@@ -70,6 +71,22 @@ make run
    curl http://localhost:8000/metrics
    ```
 
+5. **Run Interactive Examples & Client Use Cases**:
+   Explore pre-built examples in [`examples/`](examples/README.md):
+   ```bash
+   # Interactive CLI terminal chat
+   cargo run --example cli_chat
+
+   # Prefix caching & RAG acceleration
+   cargo run --example prefix_cache_rag
+
+   # Continuous batching under concurrent load
+   cargo run --example concurrent_batching
+
+   # Cooperative client cancellation demo
+   cargo run --example client_cancellation
+   ```
+
 ---
 
 ## Testing & Verification
@@ -78,7 +95,21 @@ Run the full automated test suite:
 ```bash
 make test
 ```
-*Executes all 13 unit and integration tests (continuous batching, client cancellation, paged KV-cache, prefix caching, and API handlers) in ~0.15s.*
+The default suite runs 46 unit and integration tests, including CPU tensor regressions for interleaved workers and prefix restoration, channel saturation, cancellation, API termination, configuration/request boundaries, tensor budgeting, and shared stop handling. The pretrained Qwen3 test and four manual diagnostics (chat formatting, runtime blocking, registry contention, and real-model health latency) are explicitly ignored by default. Metal-feature builds also discover a separately ignored GPU integration gate, run explicitly below. Place its tokenizer, config, and safetensors in `models/Qwen3-0.6B`, then run:
+
+```bash
+cargo test --locked --test test_qwen3 -- --ignored
+# For Metal:
+cargo test --locked --features metal --test test_qwen3 -- --ignored
+```
+
+Every completed change requires actual GPU inference verification. Run
+`make gpu-check` with local Qwen3-0.6B weights and host Metal access. The gate
+asserts an actual Metal device and checks prefix reuse, stops, EOS, shared-worker
+outputs, cancellation, and memory-budget rejection/recovery. See
+[GPU verification results](docs/gpu_validation.md) for the recorded run and limits.
+
+Explicitly requested model tests fail if weights are absent. CPU fixture tests and Metal compilation do not establish pretrained-model or GPU inference correctness. See the [prioritized implementation plan](docs/continuous_batching_and_kv_cache.md#52-priority-and-delivery-order) for remaining work.
 
 Run linters and formatters:
 ```bash
@@ -93,15 +124,15 @@ Configured via CLI arguments or environment variables:
 
 | Argument | Environment Variable | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `--host` | `MINI_HOST` | `0.0.0.0` | Bind host address |
-| `--port` | `MINI_PORT` | `8000` | Bind port |
-| `--model` | `MINI_MODEL` | `mock` | Model name or Hugging Face ID |
-| `--device` | `MINI_DEVICE` | `auto` | Target device (`auto`, `metal`, `cuda`, `cpu`) |
-| `--num-workers` | `MINI_NUM_WORKERS` | `1` | Worker threads sharing backend weights |
-| `--allow-mock-fallback` | `MINI_ALLOW_MOCK_FALLBACK` | `false` | Fall back to mock if model weights fail to load |
-| `--max-batch-size` | `MINI_MAX_BATCH_SIZE` | `8` | Maximum concurrent sequences per step |
-| `--kv-cache-blocks`| `MINI_KV_CACHE_BLOCKS` | `1024` | Total 16-token blocks in cache pool |
-| `--log-level` | `MINI_LOG_LEVEL` | `info` | Logging verbosity (`debug`, `info`, `warn`) |
+| `--host` | `RLSE_HOST` | `0.0.0.0` | Bind host address |
+| `--port` | `RLSE_PORT` | `8000` | Bind port |
+| `--model` | `RLSE_MODEL` | `mock` | Model name or Hugging Face ID |
+| `--device` | `RLSE_DEVICE` | `auto` | Target device (`auto`, `metal`, `cuda`, `cpu`) |
+| `--num-workers` | `RLSE_NUM_WORKERS` | `1` | Worker threads sharing backend weights |
+| `--allow-mock-fallback` | `RLSE_ALLOW_MOCK_FALLBACK` | `false` | Fall back to mock if model weights fail to load |
+| `--max-batch-size` | `RLSE_MAX_BATCH_SIZE` | `8` | Maximum concurrent sequences per step |
+| `--kv-cache-blocks`| `RLSE_KV_CACHE_BLOCKS` | `1024` | Total 16-token blocks in cache pool |
+| `--log-level` | `RLSE_LOG_LEVEL` | `info` | Logging verbosity (`debug`, `info`, `warn`) |
 
 ---
 

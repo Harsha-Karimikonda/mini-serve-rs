@@ -1,7 +1,7 @@
 CARGO ?= cargo
 FEATURES ?= metal
 
-.PHONY: all build run test bench lint fmt clean
+.PHONY: all build run test bench lint fmt clean gpu-check
 
 all: build
 
@@ -24,6 +24,15 @@ lint:
 fmt:
 	$(CARGO) fmt
 
+setup-hooks:
+	git config core.hooksPath .githooks
+	chmod +x .githooks/*
+	@echo "Git pre-commit hooks installed successfully!"
+
 clean:
 	$(CARGO) clean
 
+
+# Explicit pretrained Metal inference; requires local Qwen3-0.6B weights.
+gpu-check:
+	$(CARGO) test --locked --features metal --test test_gpu_inference -- --ignored --nocapture

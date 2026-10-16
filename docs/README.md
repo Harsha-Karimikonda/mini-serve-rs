@@ -1,6 +1,6 @@
-# Mini-Serve Documentation 📚
+# RLSE Documentation 📚
 
-Welcome to the comprehensive technical documentation for **Mini-Serve** (`mini-serve-rs`), a high-performance, fault-tolerant Large Language Model (LLM) inference engine and continuous batching control plane written in pure Rust.
+Welcome to the comprehensive technical documentation for **RLSE** (**R**ust **L**LM **S**erving **E**ngine), a high-performance, fault-tolerant Large Language Model (LLM) inference engine and continuous batching control plane written in pure Rust.
 
 ---
 
@@ -10,7 +10,10 @@ Welcome to the comprehensive technical documentation for **Mini-Serve** (`mini-s
 | :--- | :--- |
 | [**1. Getting Started**](getting_started.md) | Setup instructions, prerequisites, compilation with Apple Silicon Metal or CUDA, running servers, CLI options, and tests. |
 | [**2. System Architecture**](architecture.md) | High-level systems design, Tokio multi-threaded worker engine, zero-copy weight sharing, and latency-aware routing. |
-| [**3. Continuous Batching & Paged KV-Cache**](continuous_batching_and_kv_cache.md) | Iteration-level scheduling algorithms, paged memory allocation, fragmentation telemetry, prefix caching, and cooperative cancellation. |
+| [**3. Continuous Batching & Paged KV-Cache**](continuous_batching_and_kv_cache.md) | Iteration-level scheduling, cache management, cancellation, and the [prioritized improvement plan](continuous_batching_and_kv_cache.md#5-implementation-status--active-roadmap) with verification results and acceptance criteria. |
+| [**GPU verification**](gpu_validation.md) | Required actual GPU inference checks, local prerequisites, commands, hardware/model identity, and measured outcomes. |
+| [**Tensor memory reservations**](tensor_memory.md) | Active KV capacity, prefix storage ownership, byte budgeting, telemetry, and estimation limits. |
+| [**Production blocker reproductions**](production_reproductions.md) | Executed memory, HTTP responsiveness, chat/stop, and shared-backend contention diagnostics, with commands and evidence limits. |
 | [**4. Backends & Model Architecture**](backends_and_models.md) | The `ModelBackend` trait, Candle Metal runtime, native Qwen 2.5 and Qwen 3 implementations, Metal shader decomposition, and serverless Modal/CUDA roadmap. |
 | [**5. API & Telemetry Reference**](api_reference.md) | OpenAI-compatible REST endpoints (`/v1/completions`, `/v1/chat/completions`), Server-Sent Events (SSE) streaming, Prometheus `/metrics`, and the live dashboard. |
 | [**6. Performance & Benchmarks**](benchmarks_and_performance.md) | Scientific A/B benchmark methodology comparing Rust Mini-Serve vs. Python PyTorch MPS on Apple Silicon M4 with real models (`Qwen2.5-0.5B` and `Qwen3-0.6B`). |

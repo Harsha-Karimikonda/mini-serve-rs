@@ -1996,39 +1996,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
-name = "mini-serve"
-version = "0.2.0"
-dependencies = [
- "async-trait",
- "axum",
- "candle-core",
- "candle-nn",
- "candle-transformers",
- "clap",
- "futures-util",
- "hex",
- "hf-hub",
- "http-body-util",
- "metrics",
- "metrics-exporter-prometheus",
- "parking_lot",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "sysinfo",
- "tokenizers 0.21.4",
- "tokio",
- "tokio-stream",
- "tokio-test",
- "tower 0.4.13",
- "tower-http 0.5.2",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2730,6 +2697,39 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rlse"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "candle-core",
+ "candle-nn",
+ "candle-transformers",
+ "clap",
+ "futures-util",
+ "hex",
+ "hf-hub",
+ "http-body-util",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "parking_lot",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sysinfo",
+ "tokenizers 0.21.4",
+ "tokio",
+ "tokio-stream",
+ "tokio-test",
+ "tower 0.4.13",
+ "tower-http 0.5.2",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

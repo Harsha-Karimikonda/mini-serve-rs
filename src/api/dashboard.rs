@@ -3,7 +3,7 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Mini-Serve Rust Core Dashboard</title>
+  <title>RLSE Dashboard - Rust LLM Serving Engine</title>
   <style>
     :root {
       --bg: #0b0f19;
@@ -74,8 +74,8 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
   <div class="container">
     <header>
       <div class="title-group">
-        <h1>Mini-Serve <span class="rust-pill">RUST CORE v0.2.0</span></h1>
-        <p>Continuous Batching & Paged KV-Cache Engine</p>
+        <h1>RLSE <span class="rust-pill">RUST CORE v0.2.0</span></h1>
+        <p>Continuous Batching & Paged KV-Cache Control Plane</p>
       </div>
       <div class="status-badge">
         <span class="status-dot"></span>

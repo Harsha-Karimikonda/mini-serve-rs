@@ -60,7 +60,7 @@ pub struct RmsNorm {
 }
 
 impl RmsNorm {
-    pub fn new(size: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
+    pub fn new(size: usize, eps: f64, vb: VarBuilder<'_>) -> Result<Self> {
         let weight = vb.get(size, "weight")?;
         Ok(Self { weight, eps })
     }
@@ -151,7 +151,7 @@ pub struct MLP {
 }
 
 impl MLP {
-    fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &Config, vb: VarBuilder<'_>) -> Result<Self> {
         let hidden_sz = cfg.hidden_size;
         let intermediate_sz = cfg.intermediate_size;
         let gate_proj = linear_no_bias(hidden_sz, intermediate_sz, vb.pp("gate_proj"))?;
@@ -220,7 +220,7 @@ pub struct Attention {
 }
 
 impl Attention {
-    fn new(rotary_emb: Arc<RotaryEmbedding>, cfg: &Config, vb: VarBuilder) -> Result<Self> {
+    fn new(rotary_emb: Arc<RotaryEmbedding>, cfg: &Config, vb: VarBuilder<'_>) -> Result<Self> {
         let hidden_sz = cfg.hidden_size;
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
@@ -393,7 +393,7 @@ pub struct DecoderLayer {
 }
 
 impl DecoderLayer {
-    fn new(rotary_emb: Arc<RotaryEmbedding>, cfg: &Config, vb: VarBuilder) -> Result<Self> {
+    fn new(rotary_emb: Arc<RotaryEmbedding>, cfg: &Config, vb: VarBuilder<'_>) -> Result<Self> {
         let self_attn = Attention::new(rotary_emb, cfg, vb.pp("self_attn"))?;
         let mlp = MLP::new(cfg, vb.pp("mlp"))?;
         let input_layernorm =
@@ -451,7 +451,7 @@ pub struct Model {
 }
 
 impl Model {
-    pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+    pub fn new(cfg: &Config, vb: VarBuilder<'_>) -> Result<Self> {
         let vb_m = vb.pp("model");
         let embed_tokens =
             candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
@@ -491,8 +491,8 @@ impl Model {
                 })
             })
             .collect();
-        let mask = Tensor::from_slice(&mask, (tgt_len, tgt_len), &self.device)?
-            .to_dtype(self.dtype)?;
+        let mask =
+            Tensor::from_slice(&mask, (tgt_len, tgt_len), &self.device)?.to_dtype(self.dtype)?;
         let mask = if seqlen_offset > 0 {
             let mask0 = Tensor::zeros((tgt_len, seqlen_offset), self.dtype, &self.device)?;
             Tensor::cat(&[&mask0, &mask], D::Minus1)?
@@ -545,9 +545,31 @@ impl Model {
     }
 
     pub fn set_kv_snapshot(&mut self, snapshot: &[(Tensor, Tensor)]) -> Result<()> {
-        for (layer, (k, v)) in self.layers.iter_mut().zip(snapshot.iter()) {
+        if snapshot.len() != self.layers.len() {
+            candle_core::bail!("KV snapshot layer count mismatch")
+        }
+        let mut expected_len = None;
+        // Validate the entire snapshot before changing any layer.
+        for (layer, (k, v)) in self.layers.iter().zip(snapshot) {
+            let (batch, heads, len, dim) = k.dims4()?;
+            let attn = &layer.self_attn;
+            if v.dims() != k.dims()
+                || batch != 1
+                || heads != attn.num_kv_heads
+                || dim != attn.head_dim
+                || len > attn.max_seq_len
+                || expected_len.is_some_and(|expected| expected != len)
+            {
+                candle_core::bail!("Invalid KV snapshot shape")
+            }
+            expected_len = Some(len);
+        }
+        // Build independent mutable buffers; cached tensor views remain read-only.
+        let mut restored = self.clone();
+        for (layer, (k, v)) in restored.layers.iter_mut().zip(snapshot) {
             layer.set_kv_snapshot(k, v)?;
         }
+        *self = restored;
         Ok(())
     }
 
@@ -565,7 +587,7 @@ pub struct ModelForCausalLM {
 }
 
 impl ModelForCausalLM {
-    pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+    pub fn new(cfg: &Config, vb: VarBuilder<'_>) -> Result<Self> {
         let base_model = Model::new(cfg, vb.clone())?;
         let lm_head = if vb.contains_tensor("lm_head.weight") {
             linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
@@ -576,6 +598,23 @@ impl ModelForCausalLM {
             base_model,
             lm_head,
         })
+    }
+
+    /// Set the physical contiguous KV allocation before this request's first forward.
+    pub fn set_kv_capacity(&mut self, tokens: usize) -> Result<()> {
+        if tokens == 0
+            || self
+                .base_model
+                .layers
+                .iter()
+                .any(|layer| layer.self_attn.kv_cache.is_some())
+        {
+            candle_core::bail!("KV capacity must be positive and set before initialization")
+        }
+        for layer in &mut self.base_model.layers {
+            layer.self_attn.max_seq_len = tokens;
+        }
+        Ok(())
     }
 
     pub fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
@@ -800,10 +839,11 @@ mod tests {
         let v_rep = repeat_kv(v.clone(), num_kv_groups)?.contiguous()?;
         let scores_rep = (q.matmul(&k_rep.transpose(2, 3)?)? * scale)?;
         let probs_rep = candle_nn::ops::softmax(&scores_rep, candle_core::D::Minus1)?;
-        let expected_out = probs_rep
-            .matmul(&v_rep)?
-            .transpose(1, 2)?
-            .reshape((b_sz, 1, num_heads * head_dim))?;
+        let expected_out =
+            probs_rep
+                .matmul(&v_rep)?
+                .transpose(1, 2)?
+                .reshape((b_sz, 1, num_heads * head_dim))?;
 
         // 2. Zero-copy GQA method:
         let q_b = q.narrow(0, 0, 1)?.squeeze(0)?.squeeze(1)?; // [14, 64]
@@ -827,8 +867,14 @@ mod tests {
 
         // Verify batch 0 slice matches expected
         let expected_b0 = expected_out.narrow(0, 0, 1)?;
-        let diff = (expected_b0 - actual_out)?.abs()?.max_all()?.to_scalar::<f32>()?;
-        assert!(diff < 1e-5, "Max diff between repeat_kv and zero-copy GQA is {diff}");
+        let diff = (expected_b0 - actual_out)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert!(
+            diff < 1e-5,
+            "Max diff between repeat_kv and zero-copy GQA is {diff}"
+        );
         Ok(())
     }
 
@@ -890,4 +936,3 @@ mod tests {
         Ok(())
     }
 }
-

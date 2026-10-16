@@ -6,13 +6,13 @@ use http_body_util::BodyExt;
 use std::sync::Arc;
 use tower::ServiceExt;
 
-use mini_serve::api::{create_app, AppState};
-use mini_serve::backends::mock::MockBackend;
-use mini_serve::cache::{create_shared_cache, create_shared_prefix_cache};
-use mini_serve::core::config::Settings;
-use mini_serve::routing::router::{Router, WorkerHandle};
-use mini_serve::scheduler::scheduler::Scheduler;
-use mini_serve::telemetry::create_telemetry;
+use rlse::api::{create_app, AppState};
+use rlse::backends::mock::MockBackend;
+use rlse::cache::{create_shared_cache, create_shared_prefix_cache};
+use rlse::core::config::Settings;
+use rlse::routing::router::{Router, WorkerHandle};
+use rlse::scheduler::scheduler::Scheduler;
+use rlse::telemetry::create_telemetry;
 
 fn setup_test_app() -> axum::Router {
     let settings = Settings::default();
@@ -171,5 +171,212 @@ async fn test_dashboard_and_status() {
     let body = res.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["status"], "healthy");
-    assert_eq!(json["engine"], "mini-serve-rs");
+    assert_eq!(json["engine"], "rlse");
+}
+
+#[tokio::test]
+async fn streaming_endpoints_include_finish_reason_and_done() {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        for path in ["/v1/completions", "/v1/chat/completions"] {
+            let app = setup_test_app();
+            let res = app.oneshot(Request::builder().method("POST").uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({
+                    "model": "mock", "prompt": "Hello", "messages": [{"role": "user", "content": "Hello"}],
+                    "max_tokens": 4, "stream": true
+                }).to_string())).unwrap()).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let bytes = res.into_body().collect().await.unwrap().to_bytes();
+            let text = std::str::from_utf8(&bytes).unwrap();
+            assert!(text.contains("\"finish_reason\":\"length\""), "{text}");
+            assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+        }
+    }).await.expect("SSE did not terminate");
+}
+
+struct FailingBackend;
+
+#[async_trait::async_trait]
+impl rlse::backends::ModelBackend for FailingBackend {
+    fn name(&self) -> &str {
+        "failing"
+    }
+    async fn init_sequence(&self, _: &str) -> Result<Vec<u32>, rlse::core::errors::EngineError> {
+        Ok(vec![1])
+    }
+    async fn step_batch(
+        &self,
+        _: &mut [rlse::core::types::ActiveSequence],
+    ) -> Result<Vec<rlse::backends::StepToken>, rlse::core::errors::EngineError> {
+        Err(rlse::core::errors::EngineError::BackendError(
+            "injected backend failure".into(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn backend_failure_is_explicit_for_both_apis_and_releases_cache() {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        for path in ["/v1/completions", "/v1/chat/completions"] {
+            for stream in [false, true] {
+                let cache = create_shared_cache(256, 16);
+                let prefix_cache = create_shared_prefix_cache(16, 128);
+                let scheduler = Arc::new(Scheduler::new(4, 32, cache.clone(), prefix_cache.clone(), Arc::new(FailingBackend)));
+                let handle = scheduler.start_loop();
+                let app = create_app(AppState {
+                    router: Arc::new(Router::new(vec![WorkerHandle::new("failing", scheduler.clone())])),
+                    cache: cache.clone(), prefix_cache, telemetry: create_telemetry(), settings: Settings::default(),
+                });
+                let res = app.oneshot(Request::builder().method("POST").uri(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::json!({
+                        "model": "mock", "prompt": "Hello", "messages": [{"role": "user", "content": "Hello"}],
+                        "max_tokens": 4, "stream": stream
+                    }).to_string())).unwrap()).await.unwrap();
+                assert_eq!(res.status(), if stream { StatusCode::OK } else { StatusCode::INTERNAL_SERVER_ERROR });
+                let bytes = res.into_body().collect().await.unwrap().to_bytes();
+                let text = std::str::from_utf8(&bytes).unwrap();
+                assert!(text.contains("injected backend failure"), "{text}");
+                assert!(!text.contains("[DONE]"));
+                assert_eq!(cache.lock().allocated_count(), 0);
+                scheduler.shutdown();
+                handle.await.unwrap();
+            }
+        }
+    }).await.expect("error response did not terminate");
+}
+
+#[tokio::test]
+async fn invalid_limits_fail_before_json_or_sse_generation() {
+    let app = setup_test_app();
+    for route in ["/v1/completions", "/v1/chat/completions"] {
+        for stream in [false, true] {
+            for (field, value, message, status) in [
+                (
+                    "max_tokens",
+                    serde_json::json!(0),
+                    "max_tokens",
+                    StatusCode::BAD_REQUEST,
+                ),
+                (
+                    "temperature",
+                    serde_json::json!(-0.1),
+                    "temperature",
+                    StatusCode::BAD_REQUEST,
+                ),
+                (
+                    "temperature",
+                    serde_json::json!(2.1),
+                    "temperature",
+                    StatusCode::BAD_REQUEST,
+                ),
+                (
+                    "top_p",
+                    serde_json::json!(0),
+                    "top_p",
+                    StatusCode::BAD_REQUEST,
+                ),
+                (
+                    "top_p",
+                    serde_json::json!(1.1),
+                    "top_p",
+                    StatusCode::BAD_REQUEST,
+                ),
+                (
+                    "max_tokens",
+                    serde_json::json!(4096),
+                    "KV capacity",
+                    StatusCode::TOO_MANY_REQUESTS,
+                ),
+            ] {
+                let mut payload = serde_json::json!({
+                    "model": "mock", "prompt": "one", "messages": [{"role": "user", "content": "one"}],
+                    "max_tokens": 1, "stream": stream,
+                });
+                payload[field] = value;
+                let response = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    app.clone().oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(route)
+                            .header("content-type", "application/json")
+                            .body(Body::from(payload.to_string()))
+                            .unwrap(),
+                    ),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(response.status(), status, "{route} {payload}");
+                if status == StatusCode::TOO_MANY_REQUESTS {
+                    assert_eq!(response.headers()["retry-after"], "1");
+                }
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert!(
+                    error["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains(message),
+                    "{error}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn tensor_memory_telemetry_is_separate_from_logical_blocks() {
+    let app = setup_test_app();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let memory = &status["tensor_memory"];
+    assert_eq!(status["cache"]["allocated_blocks"], 0);
+    assert_eq!(memory["active_kv_reserved_bytes"], 0);
+    assert_eq!(memory["prefix_retained_bytes"], 0);
+    assert_eq!(memory["reserved_bytes"], memory["headroom_bytes"]);
+    assert_eq!(
+        memory["reserved_bytes"].as_u64().unwrap() + memory["available_bytes"].as_u64().unwrap(),
+        memory["budget_bytes"].as_u64().unwrap()
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let text = std::str::from_utf8(&body).unwrap();
+    for name in [
+        "budget",
+        "headroom",
+        "active_kv_reserved",
+        "execution_reserved",
+        "prefix_retained",
+        "reserved",
+        "available",
+        "peak_reserved",
+    ] {
+        assert!(text.contains(&format!("# TYPE mini_tensor_memory_{name}_bytes gauge")));
+        assert!(text.contains(&format!(
+            "mini_tensor_memory_{name}_bytes {}\n",
+            memory[format!("{name}_bytes")]
+        )));
+    }
+    assert!(text.contains("mini_tensor_memory_rejections_total 0\n"));
+    assert!(text.contains("mini_prefix_tensor_evictions_total 0\n"));
 }

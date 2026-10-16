@@ -12,7 +12,6 @@ use futures_util::StreamExt;
 use serde_json::json;
 use std::convert::Infallible;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use tokio_stream::wrappers::ReceiverStream;
 
 use crate::api::dashboard::DASHBOARD_HTML;
 use crate::cache::{SharedKVCache, SharedPrefixCache};
@@ -45,6 +44,41 @@ pub fn create_app(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Turn unexpected worker/channel closure into an explicit SSE error.
+fn response_events(
+    rx: tokio::sync::mpsc::Receiver<TokenEvent>,
+) -> impl futures_util::Stream<Item = TokenEvent> {
+    futures_util::stream::unfold((rx, false), |(mut rx, ended)| async move {
+        if ended {
+            return None;
+        }
+        let event = rx.recv().await.unwrap_or_else(|| {
+            TokenEvent::Error("Generation channel closed without terminal state".to_string())
+        });
+        let ended = !matches!(event, TokenEvent::Token(_));
+        Some((event, (rx, ended)))
+    })
+}
+
+async fn collect_response(
+    mut rx: tokio::sync::mpsc::Receiver<TokenEvent>,
+) -> Result<(String, TokenUsage, String), EngineError> {
+    let mut text = String::new();
+    while let Some(event) = rx.recv().await {
+        match event {
+            TokenEvent::Token(token) => text.push_str(&token),
+            TokenEvent::Done {
+                usage,
+                finish_reason,
+            } => return Ok((text, usage, finish_reason)),
+            TokenEvent::Error(error) => return Err(EngineError::BackendError(error)),
+        }
+    }
+    Err(EngineError::BackendError(
+        "Generation channel closed without terminal state".to_string(),
+    ))
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -74,7 +108,7 @@ async fn models_handler(State(state): State<AppState>) -> Json<ModelListResponse
                 id: state.settings.model.clone(),
                 object: "model".to_string(),
                 created: now,
-                owned_by: "mini-serve-rs".to_string(),
+                owned_by: "rlse".to_string(),
             },
             ModelCard {
                 id: "mock".to_string(),
@@ -117,9 +151,8 @@ async fn completions_handler(
         let stream_model = req.model.clone();
         let telemetry = state.telemetry.clone();
 
-        let sse_stream = ReceiverStream::new(rx).flat_map(move |event| match event {
+        let sse_stream = response_events(rx).flat_map(move |event| match event {
             TokenEvent::Token(token_text) => {
-                telemetry.record_tokens(1);
                 let chunk = CompletionChunk {
                     id: stream_req_id.clone(),
                     object: "text_completion.chunk".to_string(),
@@ -131,11 +164,15 @@ async fn completions_handler(
                         finish_reason: None,
                     }],
                 };
-                futures_util::stream::iter(vec![
-                    Ok::<Event, Infallible>(Event::default().data(serde_json::to_string(&chunk).unwrap())),
-                ])
+                futures_util::stream::iter(vec![Ok::<Event, Infallible>(
+                    Event::default().data(serde_json::to_string(&chunk).unwrap()),
+                )])
             }
-            TokenEvent::Done { finish_reason, .. } => {
+            TokenEvent::Done {
+                finish_reason,
+                usage,
+            } => {
+                telemetry.record_tokens(usage.completion_tokens);
                 let final_chunk = CompletionChunk {
                     id: stream_req_id.clone(),
                     object: "text_completion.chunk".to_string(),
@@ -148,7 +185,9 @@ async fn completions_handler(
                     }],
                 };
                 futures_util::stream::iter(vec![
-                    Ok::<Event, Infallible>(Event::default().data(serde_json::to_string(&final_chunk).unwrap())),
+                    Ok::<Event, Infallible>(
+                        Event::default().data(serde_json::to_string(&final_chunk).unwrap()),
+                    ),
                     Ok::<Event, Infallible>(Event::default().data("[DONE]")),
                 ])
             }
@@ -160,9 +199,9 @@ async fn completions_handler(
                         "code": 500
                     }
                 });
-                futures_util::stream::iter(vec![
-                    Ok::<Event, Infallible>(Event::default().data(serde_json::to_string(&err_json).unwrap())),
-                ])
+                futures_util::stream::iter(vec![Ok::<Event, Infallible>(
+                    Event::default().data(serde_json::to_string(&err_json).unwrap()),
+                )])
             }
         });
 
@@ -170,31 +209,7 @@ async fn completions_handler(
             .keep_alive(KeepAlive::default())
             .into_response())
     } else {
-        let mut rx = rx;
-        let mut full_text = String::new();
-        let mut final_usage = TokenUsage {
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            total_tokens: 0,
-        };
-        let mut final_finish_reason = "stop".to_string();
-
-        while let Some(event) = rx.recv().await {
-            match event {
-                TokenEvent::Token(text) => {
-                    full_text.push_str(&text);
-                }
-                TokenEvent::Done { usage, finish_reason } => {
-                    final_usage = usage;
-                    final_finish_reason = finish_reason;
-                    break;
-                }
-                TokenEvent::Error(err) => {
-                    return Err(EngineError::BackendError(err));
-                }
-            }
-        }
-
+        let (full_text, final_usage, final_finish_reason) = collect_response(rx).await?;
         state.telemetry.record_tokens(final_usage.completion_tokens);
 
         let response = CompletionResponse {
@@ -261,9 +276,8 @@ async fn chat_completions_handler(
         let stream_model = req.model.clone();
         let telemetry = state.telemetry.clone();
 
-        let sse_stream = ReceiverStream::new(rx).flat_map(move |event| match event {
+        let sse_stream = response_events(rx).flat_map(move |event| match event {
             TokenEvent::Token(token_text) => {
-                telemetry.record_tokens(1);
                 let chunk = ChatCompletionChunk {
                     id: stream_req_id.clone(),
                     object: "chat.completion.chunk".to_string(),
@@ -278,11 +292,15 @@ async fn chat_completions_handler(
                         finish_reason: None,
                     }],
                 };
-                futures_util::stream::iter(vec![
-                    Ok::<Event, Infallible>(Event::default().data(serde_json::to_string(&chunk).unwrap())),
-                ])
+                futures_util::stream::iter(vec![Ok::<Event, Infallible>(
+                    Event::default().data(serde_json::to_string(&chunk).unwrap()),
+                )])
             }
-            TokenEvent::Done { finish_reason, .. } => {
+            TokenEvent::Done {
+                finish_reason,
+                usage,
+            } => {
+                telemetry.record_tokens(usage.completion_tokens);
                 let final_chunk = ChatCompletionChunk {
                     id: stream_req_id.clone(),
                     object: "chat.completion.chunk".to_string(),
@@ -298,7 +316,9 @@ async fn chat_completions_handler(
                     }],
                 };
                 futures_util::stream::iter(vec![
-                    Ok::<Event, Infallible>(Event::default().data(serde_json::to_string(&final_chunk).unwrap())),
+                    Ok::<Event, Infallible>(
+                        Event::default().data(serde_json::to_string(&final_chunk).unwrap()),
+                    ),
                     Ok::<Event, Infallible>(Event::default().data("[DONE]")),
                 ])
             }
@@ -310,9 +330,9 @@ async fn chat_completions_handler(
                         "code": 500
                     }
                 });
-                futures_util::stream::iter(vec![
-                    Ok::<Event, Infallible>(Event::default().data(serde_json::to_string(&err_json).unwrap())),
-                ])
+                futures_util::stream::iter(vec![Ok::<Event, Infallible>(
+                    Event::default().data(serde_json::to_string(&err_json).unwrap()),
+                )])
             }
         });
 
@@ -320,31 +340,7 @@ async fn chat_completions_handler(
             .keep_alive(KeepAlive::default())
             .into_response())
     } else {
-        let mut rx = rx;
-        let mut full_text = String::new();
-        let mut final_usage = TokenUsage {
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            total_tokens: 0,
-        };
-        let mut final_finish_reason = "stop".to_string();
-
-        while let Some(event) = rx.recv().await {
-            match event {
-                TokenEvent::Token(text) => {
-                    full_text.push_str(&text);
-                }
-                TokenEvent::Done { usage, finish_reason } => {
-                    final_usage = usage;
-                    final_finish_reason = finish_reason;
-                    break;
-                }
-                TokenEvent::Error(err) => {
-                    return Err(EngineError::BackendError(err));
-                }
-            }
-        }
-
+        let (full_text, final_usage, final_finish_reason) = collect_response(rx).await?;
         state.telemetry.record_tokens(final_usage.completion_tokens);
 
         let response = ChatCompletionResponse {
@@ -379,6 +375,8 @@ async fn status_handler(State(state): State<AppState>) -> Json<serde_json::Value
     let cache_stats = state.cache.lock().stats();
     let (hits, misses, tokens_saved) = state.prefix_cache.lock().stats();
     let hit_rate = state.prefix_cache.lock().hit_rate();
+    let memory = state.prefix_cache.lock().memory_budget().stats();
+    let prefix_evictions = state.prefix_cache.lock().tensor_evictions();
 
     let workers_info: Vec<serde_json::Value> = state
         .router
@@ -399,7 +397,7 @@ async fn status_handler(State(state): State<AppState>) -> Json<serde_json::Value
 
     Json(json!({
         "status": "healthy",
-        "engine": "mini-serve-rs",
+        "engine": "rlse",
         "version": "0.2.0",
         "model": state.settings.model,
         "tokens_per_sec": state.telemetry.tokens_per_second(),
@@ -413,7 +411,9 @@ async fn status_handler(State(state): State<AppState>) -> Json<serde_json::Value
             "utilization": cache_stats.utilization,
             "fragmentation": cache_stats.fragmentation
         },
+        "tensor_memory": memory,
         "prefix_cache": {
+            "tensor_evictions": prefix_evictions,
             "hits": hits,
             "misses": misses,
             "tokens_saved": tokens_saved,
@@ -452,9 +452,52 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
         cache.fragmentation
     ));
 
+    let memory = state.prefix_cache.lock().memory_budget().stats();
+    for (name, value) in [
+        ("budget", memory.budget_bytes),
+        ("headroom", memory.headroom_bytes),
+        ("active_kv_reserved", memory.active_kv_reserved_bytes),
+        ("execution_reserved", memory.execution_reserved_bytes),
+        ("prefix_retained", memory.prefix_retained_bytes),
+        ("reserved", memory.reserved_bytes),
+        ("available", memory.available_bytes),
+        ("peak_reserved", memory.peak_reserved_bytes),
+    ] {
+        body.push_str(&format!("# HELP mini_tensor_memory_{name}_bytes Tensor memory reservation accounting in bytes (excludes weights)\n# TYPE mini_tensor_memory_{name}_bytes gauge\nmini_tensor_memory_{name}_bytes {value}\n"));
+    }
+    body.push_str(&format!("# HELP mini_tensor_memory_rejections_total Failed tensor memory reservations\n# TYPE mini_tensor_memory_rejections_total counter\nmini_tensor_memory_rejections_total {}\n", memory.rejections));
+    body.push_str(&format!("# HELP mini_prefix_tensor_evictions_total Evicted prefix tensor entries\n# TYPE mini_prefix_tensor_evictions_total counter\nmini_prefix_tensor_evictions_total {}\n", state.prefix_cache.lock().tensor_evictions()));
+
     (
         StatusCode::OK,
         [("content-type", "text/plain; version=0.0.4")],
         body,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn channel_closure_is_an_error_for_json_and_sse() {
+        for streaming in [false, true] {
+            let (tx, rx) = tokio::sync::mpsc::channel(2);
+            tx.send(TokenEvent::Token("partial".into())).await.unwrap();
+            drop(tx);
+            if streaming {
+                let events: Vec<_> = response_events(rx).collect().await;
+                assert_eq!(events.len(), 2);
+                assert!(
+                    matches!(&events[1], TokenEvent::Error(e) if e.contains("without terminal"))
+                );
+            } else {
+                assert!(collect_response(rx)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("without terminal"));
+            }
+        }
+    }
 }

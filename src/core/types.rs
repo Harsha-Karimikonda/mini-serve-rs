@@ -53,6 +53,33 @@ impl Default for SamplingParams {
     }
 }
 
+impl SamplingParams {
+    pub fn validate(&self) -> Result<(), crate::core::errors::EngineError> {
+        use crate::core::errors::EngineError;
+        if self.max_tokens == 0 {
+            return Err(EngineError::InvalidRequest(
+                "max_tokens must be greater than zero".into(),
+            ));
+        }
+        if !self.temperature.is_finite() || !(0.0..=2.0).contains(&self.temperature) {
+            return Err(EngineError::InvalidRequest(
+                "temperature must be finite and in [0, 2]".into(),
+            ));
+        }
+        if !self.top_p.is_finite() || self.top_p <= 0.0 || self.top_p > 1.0 {
+            return Err(EngineError::InvalidRequest(
+                "top_p must be finite and in (0, 1]".into(),
+            ));
+        }
+        if self.stop.iter().any(String::is_empty) {
+            return Err(EngineError::InvalidRequest(
+                "stop strings must not be empty".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionRequest {
     pub model: String,
@@ -203,7 +230,9 @@ pub struct ActiveSequence {
     pub prompt: String,
     pub prompt_tokens: Vec<u32>,
     pub output_tokens: Vec<u32>,
+    /// Raw decoded text, including withheld stop prefixes, for incremental decoding.
     pub output_text: String,
+    pub stop_matcher: crate::core::stop::StopMatcher,
     pub sampling: SamplingParams,
     pub is_prefilled: bool,
     pub is_finished: bool,
@@ -213,6 +242,9 @@ pub struct ActiveSequence {
     pub ttft_measured: bool,
     pub ttft_duration: Option<std::time::Duration>,
     pub tx: tokio::sync::mpsc::Sender<TokenEvent>,
+    /// Capacity reserved at admission so a terminal event cannot be dropped.
+    pub terminal_permit: Option<tokio::sync::mpsc::OwnedPermit<TokenEvent>>,
+    pub terminal_error: Option<String>,
 }
 
 impl ActiveSequence {
@@ -222,12 +254,14 @@ impl ActiveSequence {
         sampling: SamplingParams,
         tx: tokio::sync::mpsc::Sender<TokenEvent>,
     ) -> Self {
+        let stop_matcher = crate::core::stop::StopMatcher::new(sampling.stop.clone());
         Self {
             request_id,
             prompt,
             prompt_tokens: Vec::new(),
             output_tokens: Vec::new(),
             output_text: String::new(),
+            stop_matcher,
             sampling,
             is_prefilled: false,
             is_finished: false,
@@ -237,6 +271,17 @@ impl ActiveSequence {
             ttft_measured: false,
             ttft_duration: None,
             tx,
+            terminal_permit: None,
+            terminal_error: None,
+        }
+    }
+
+    pub fn send_terminal(&mut self, event: TokenEvent) {
+        if let Some(permit) = self.terminal_permit.take() {
+            permit.send(event);
+        } else {
+            // Manually constructed sequences may not have a reserved slot.
+            let _ = self.tx.try_send(event);
         }
     }
 

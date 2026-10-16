@@ -6,6 +6,8 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct StepToken {
     pub token_id: u32,
+    /// Raw decoded fragment. Special EOS markers must produce empty text.
+    /// Shared scheduling applies user-defined stops before delivery.
     pub text: String,
     pub is_eos: bool,
 }
@@ -13,7 +15,21 @@ pub struct StepToken {
 #[async_trait]
 pub trait ModelBackend: Send + Sync {
     fn name(&self) -> &str;
+    /// Maximum supported prompt plus output length, when the model has a context limit.
+    fn context_length(&self) -> Option<usize> {
+        None
+    }
+    /// Tokenize only: admission calls this before allocating request execution state.
     async fn init_sequence(&self, prompt: &str) -> Result<Vec<u32>, EngineError>;
+    /// Reserve execution resources before logical allocation and the first forward.
+    fn reserve_sequence(
+        &self,
+        _request_id: &RequestId,
+        _prompt_tokens: usize,
+        _max_tokens: usize,
+    ) -> Result<(), EngineError> {
+        Ok(())
+    }
     async fn step_batch(
         &self,
         sequences: &mut [ActiveSequence],

@@ -2,26 +2,36 @@ use clap::Parser;
 use std::sync::Arc;
 use tracing::info;
 
-use mini_serve::api::{create_app, AppState};
-use mini_serve::backends::mock::MockBackend;
-use mini_serve::cache::{create_shared_cache, create_shared_prefix_cache};
-use mini_serve::core::config::Settings;
-use mini_serve::routing::router::{Router, WorkerHandle};
-use mini_serve::scheduler::scheduler::Scheduler;
-use mini_serve::telemetry::{create_telemetry, init_logging};
+use rlse::api::{create_app, AppState};
+use rlse::backends::mock::MockBackend;
+use rlse::cache::tensor_memory::TensorMemoryBudget;
+use rlse::cache::{create_shared_cache, PrefixCache};
+use rlse::core::config::Settings;
+use rlse::routing::router::{Router, WorkerHandle};
+use rlse::scheduler::scheduler::Scheduler;
+use rlse::telemetry::{create_telemetry, init_logging};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let settings = Settings::parse();
+    settings.validate()?;
     init_logging(&settings.log_level);
 
     info!(
-        "Starting Mini-Serve Rust Core v0.2.0 on {}:{} (model={}, workers={})",
+        "Starting RLSE (Rust LLM Serving Engine) v0.2.0 on {}:{} (model={}, workers={})",
         settings.host, settings.port, settings.model, settings.num_workers
     );
 
     let cache = create_shared_cache(settings.kv_cache_blocks, settings.block_size);
-    let prefix_cache = create_shared_prefix_cache(settings.block_size, 512);
+    let memory_budget = TensorMemoryBudget::new(
+        settings.tensor_memory_budget_bytes,
+        settings.execution_headroom_bytes,
+    )?;
+    let prefix_cache = Arc::new(parking_lot::Mutex::new(PrefixCache::with_memory_budget(
+        settings.block_size,
+        512,
+        memory_budget,
+    )));
     let telemetry = create_telemetry();
 
     if let Some(ref token) = settings.hf_token {
@@ -29,16 +39,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Initialize backend (Mock if requested, or Candle on Metal/CPU)
-    let backend: Arc<dyn mini_serve::backends::ModelBackend> = if settings.model == "mock" {
+    let backend: Arc<dyn rlse::backends::ModelBackend> = if settings.model == "mock" {
         Arc::new(MockBackend::new(&settings.model, 3))
     } else {
         info!(
             "Loading real Hugging Face model {} via Candle backend...",
             settings.model
         );
-        match mini_serve::backends::CandleBackend::load_hf(&settings.model, &settings.device) {
+        match rlse::backends::CandleBackend::load_hf(&settings.model, &settings.device) {
             Ok(mut candle_backend) => {
-                candle_backend.set_prefix_cache(prefix_cache.clone());
+                candle_backend.try_set_prefix_cache(prefix_cache.clone())?;
                 Arc::new(candle_backend)
             }
             Err(e) => {
@@ -101,7 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         worker.scheduler.shutdown();
     }
 
-    info!("Mini-Serve gracefully terminated");
+    info!("RLSE gracefully terminated");
     Ok(())
 }
 

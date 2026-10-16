@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -e
+
+echo "🔍 Running pre-commit lint checks..."
+
+# Check code formatting
+if ! cargo fmt --check; then
+    echo "❌ Code formatting check failed."
+    echo "💡 Run 'make fmt' or 'cargo fmt' to automatically format your code."
+    exit 1
+fi
+
+# Detect whether metal feature should be checked (on macOS) or default
+FEATURES="metal"
+if [[ "$OSTYPE" != "darwin"* ]]; then
+    FEATURES=""
+fi
+
+if [ -n "$FEATURES" ]; then
+    echo "🦀 Running Clippy with features: $FEATURES..."
+    cargo clippy --features "$FEATURES" --all-targets -- -D warnings
+else
+    echo "🦀 Running Clippy..."
+    cargo clippy --all-targets -- -D warnings
+fi
+
+echo "✅ Pre-commit lint checks passed!"
+

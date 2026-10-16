@@ -1,4 +1,4 @@
-//! Pure Rust Benchmark Harness for Mini-Serve
+//! Pure Rust Benchmark Harness for RLSE
 //!
 //! Run with:
 //! cargo run --example bench --features metal -- [OPTIONS]
@@ -48,7 +48,7 @@ the engine must immediately cease forward computation for that sequence, reclaim
 Please analyze the architectural synergy between continuous batching, paged memory allocation, and zero-overhead systems programming.";
 
 #[derive(Parser, Debug)]
-#[command(name = "mini-serve-bench", about = "Pure Rust benchmark harness")]
+#[command(name = "rlse-bench", about = "Pure Rust benchmark harness for RLSE")]
 struct Args {
     #[arg(long, default_value = "http://127.0.0.1:8002")]
     url: String,
@@ -218,7 +218,7 @@ async fn main() {
         .expect("Failed to build client");
 
     println!("========================================================");
-    println!("PURE RUST BENCHMARK HARNESS (Mini-Serve)");
+    println!("PURE RUST BENCHMARK HARNESS (RLSE)");
     println!("Target URL : {}", args.url);
     println!("Model ID   : {}", args.model);
     println!("========================================================");

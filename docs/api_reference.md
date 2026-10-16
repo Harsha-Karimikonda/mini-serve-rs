@@ -6,6 +6,28 @@ Mini-Serve exposes a fully OpenAI-compatible REST API alongside Prometheus metri
 
 ## 1. OpenAI-Compatible Endpoints
 
+Both generation endpoints require `max_tokens > 0`, finite `temperature` in
+`[0, 2]` (`0` selects greedy decoding), and finite `top_p` in `(0, 1]`.
+Stop strings must be nonempty. Invalid values return HTTP 400 before generation,
+including when `stream: true`.
+
+Stop matching is shared by both endpoints and backends. Partial stop prefixes
+are withheld across decoded token boundaries. The first completed stop wins
+(ties prefer the earliest start), its text is removed, and `finish_reason` is
+`stop`. Unmatched buffered text is flushed on EOS or the token limit. Qwen's
+`<|im_end|>` and `<|endoftext|>` markers are suppressed. Usage counts generated
+token IDs, including tokens with no visible text and EOS, so visible chunks
+cannot be used as an exact token count. Successful SSE token telemetry records
+the terminal usage when generation finishes.
+
+The tokenized prompt plus `max_tokens` must fit the model context (HTTP 400) and
+the configured logical KV capacity (HTTP 429 with `Retry-After`). Capacity is
+`kv_cache_blocks * block_size`, shared by workers; it is not a tensor-memory
+budget. Concurrent requests can exhaust available blocks after admission. Such
+requests terminate explicitly with an error (HTTP 500 for a collected JSON
+response, or an SSE error event after streaming begins), never a successful
+`length` completion. Their logical blocks and backend state are released.
+
 ### A. Completions (`POST /v1/completions`)
 
 #### Request Body
@@ -92,7 +114,7 @@ curl http://localhost:8000/v1/models
       "id": "Qwen/Qwen3-0.6B",
       "object": "model",
       "created": 1791492084,
-      "owned_by": "mini-serve-rs"
+      "owned_by": "rlse"
     }
   ]
 }
@@ -188,3 +210,15 @@ Mini-Serve compiles an embedded dark-mode HTML5/CSS3 control dashboard directly 
   - Multi-worker load status and queue backlog meters.
   - Interactive prompt testing playground with real-time token streaming.
 
+
+## Tensor memory telemetry
+
+`/api/status` reports `tensor_memory` separately from logical `cache` blocks:
+`budget_bytes`, `headroom_bytes`, `active_kv_reserved_bytes`,
+`execution_reserved_bytes`, `prefix_retained_bytes`, `reserved_bytes`,
+`available_bytes`, `peak_reserved_bytes`, and `rejections`.
+`prefix_cache.tensor_evictions` counts evicted tensor entries.
+The byte fields have corresponding `mini_tensor_memory_*_bytes` Prometheus
+gauges; rejection and eviction counters are `mini_tensor_memory_rejections_total`
+and `mini_prefix_tensor_evictions_total`. These are conservative reservations,
+with model weights excluded. See [memory accounting](tensor_memory.md).
