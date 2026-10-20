@@ -4,6 +4,62 @@ Completed changes must include an actual GPU inference run, in addition to CPU
 regressions and feature builds. This project rule is recorded in [AGENTS.md](../AGENTS.md).
 If GPU access or weights are unavailable, GPU verification stays pending.
 
+## Root README refresh verification: 2026-10-20
+
+Documentation-only change: aligned the root README with all 21 CLI settings,
+authentication and client limits, logical KV accounting and contiguous tensor
+storage, serialized shared-backend execution, portable startup, explicit GPU
+commands, and the current CUDA/paging roadmap. Historical performance figures
+are linked with their original measurement scope. No runtime code changed.
+All local README link targets and all Settings flag names were checked against
+the tree; `git diff --check` passed.
+
+Exact regression commands:
+
+```bash
+export CARGO_HOME=/private/tmp/rlse-cargo
+export RUSTUP_HOME=/private/tmp/rlse-rustup
+export PATH="$CARGO_HOME/bin:$PATH"
+cargo test --locked --all-targets
+RLSE_GPU_DEVICE=metal RLSE_GPU_MODEL_DIR=models/Qwen3-0.6B cargo test --locked --features metal --test test_gpu_inference --test test_pretrained_quality -- --ignored --nocapture
+shasum -a 256 models/Qwen3-0.6B/*
+git diff --check
+```
+
+Initial bare `cargo` calls were unavailable in the shell PATH. The reruns used
+the toolchain environment above and the absolute Cargo executable
+`/private/tmp/rlse-cargo/bin/cargo`. Sandbox runs could not bind sockets for the
+three process tests; Metal discovery panicked before establishing a device.
+Both suites were rerun successfully with host access; those initial attempts
+are not GPU evidence.
+
+CPU result: **75 passed**, zero failed, two opt-in tests ignored, including all
+three process shutdown tests. GPU integration: **1 passed** in **40.44 s**.
+Independent pretrained reference: **1 passed** in **5.16 s**. Both GPU tests
+asserted and printed actual device `Metal(MetalDevice(DeviceId(1)))` on Apple M4,
+using local `models/Qwen3-0.6B`, revision
+`c1899de289a04d12100db370d81485cdf75e47ca`, Candle 0.11, F16 weights,
+debug/test build. All four artifact hashes match the identity table below.
+
+Sampling: greedy, temperature 0, top-p 1; integration completion/chat and prefix/
+worker probes use 12-token limits, EOS 32, cancellation 512, reservation rejection
+4000, and injected-error 128. Independent reference cases allow 32 tokens each.
+Integration checks passed prefix equivalence/accounting, JSON/SSE authentication,
+client isolation and quota rejection/recovery, stops/EOS, shared-worker outputs,
+cancellation, draining, reservation rejection/recovery, and returned-error
+quarantine. Counters: 31 accepted, 27 completed, 2 errors, 2 cancellations,
+279 generated tokens. Active/prefix reservations and logical blocks were released;
+fixed headroom remained 33,554,432 bytes; peak reservation was 188,183,808 bytes.
+Independent reference token IDs/text matched all four cases: instruction
+(`Paris.`, 7 tokens), role context (`cobalt`, 7), Spanish (`Hola`, 6), and stop
+(`red green blue.`, 9). Counts include thinking delimiters and EOS; the thinking
+delimiters remain visible, and the stop case retains `red` after them.
+
+Limits: this run validates documented existing behaviors, not throughput or
+binary size. CUDA pretrained inference, physical PagedAttention integration,
+broader quality evaluation, numeric logit tolerances, driver OOM/hang recovery,
+production load, and hosted CI remain unverified.
+
 ## Pre-commit verification: 2026-10-20
 
 This run covers the client quota, execution telemetry, SSE benchmark, prefix
