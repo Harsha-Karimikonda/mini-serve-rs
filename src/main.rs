@@ -1,4 +1,5 @@
 use clap::Parser;
+use std::future::IntoFuture;
 use std::sync::Arc;
 use tracing::info;
 
@@ -71,6 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Spawn multi-worker schedulers with shared memory weights and caches
     let mut worker_handles = Vec::with_capacity(settings.num_workers);
+    let mut tasks = Vec::with_capacity(settings.num_workers);
     for i in 0..settings.num_workers {
         let worker_id = format!("worker-{}", i + 1);
         let scheduler = Arc::new(Scheduler::new(
@@ -82,7 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
 
         // Start worker continuous batching loop
-        scheduler.start_loop();
+        tasks.push(scheduler.start_loop());
         worker_handles.push(WorkerHandle::new(worker_id, scheduler));
     }
 
@@ -102,20 +104,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Server listening on http://{}", addr);
     info!("Dashboard available at http://{}/dashboard", addr);
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
-
-    info!("Shutting down continuous batching schedulers...");
+    let shutdown_router = router.clone();
+    let drain_timeout = std::time::Duration::from_millis(settings.shutdown_timeout_ms);
+    let (signal_tx, signal_rx) = tokio::sync::oneshot::channel();
+    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("Shutdown signal received; stopping admission and draining workers");
+        for worker in shutdown_router.workers() {
+            worker.scheduler.begin_drain(drain_timeout);
+        }
+        let _ = signal_tx.send(());
+    });
+    let serving = server.into_future();
+    tokio::pin!(serving);
+    tokio::select! {
+        result = &mut serving => { result?; }
+        _ = signal_rx => {
+            let drained = tokio::time::timeout(drain_timeout, async {
+                // Workers enforce their deadline between steps; allow terminal
+                // delivery and joins within the same process shutdown bound.
+                let _ = (&mut serving).await;
+                futures_util::future::join_all(tasks.drain(..)).await;
+            }).await;
+            if drained.is_err() {
+                for worker in router.workers() { worker.scheduler.shutdown(); }
+                tracing::error!("Shutdown deadline exceeded; terminating process");
+                std::process::exit(1);
+            }
+        }
+    }
     for worker in router.workers() {
         worker.scheduler.shutdown();
     }
-
+    if tokio::time::timeout(drain_timeout, futures_util::future::join_all(tasks))
+        .await
+        .is_err()
+    {
+        tracing::error!("Inference shutdown deadline exceeded; terminating process");
+        std::process::exit(1);
+    }
     info!("RLSE gracefully terminated");
     Ok(())
-}
-
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
-    info!("Shutdown signal received, draining in-flight requests...");
 }

@@ -11,6 +11,7 @@ use crate::cache::{SharedKVCache, SharedPrefixCache};
 use crate::core::errors::EngineError;
 use crate::core::types::{RequestId, SamplingParams};
 use crate::scheduler::sequence::{ActiveSequence, TokenEvent};
+use crate::telemetry::metrics::{ExecutionStats, Outcome, RequestTrace};
 
 struct QueueItem {
     prompt_tokens: Vec<u32>,
@@ -20,6 +21,8 @@ struct QueueItem {
     tx: mpsc::Sender<TokenEvent>,
     terminal_permit: mpsc::OwnedPermit<TokenEvent>,
     enqueued_at: Instant,
+    trace: RequestTrace,
+    client_permit: Option<Arc<crate::core::client_limits::ClientPermit>>,
 }
 
 #[derive(Debug, Clone)]
@@ -27,10 +30,15 @@ pub struct SchedulerMetrics {
     pub queue_depth: usize,
     pub active_count: usize,
     pub avg_latency_ms: f64,
+    pub execution: ExecutionStats,
 }
 
 pub struct Scheduler {
+    execution: Arc<Mutex<ExecutionStats>>,
+    token_rate: crate::telemetry::SharedTelemetry,
     accepting: AtomicBool,
+    started: AtomicBool,
+    drain_deadline: Mutex<Option<Instant>>,
     max_batch_size: usize,
     max_waiting_requests: usize,
     cache: SharedKVCache,
@@ -52,7 +60,11 @@ impl Scheduler {
         backend: Arc<dyn ModelBackend>,
     ) -> Self {
         Self {
+            execution: Arc::new(Mutex::new(ExecutionStats::default())),
+            token_rate: crate::telemetry::create_telemetry(),
             accepting: AtomicBool::new(true),
+            started: AtomicBool::new(false),
+            drain_deadline: Mutex::new(None),
             max_batch_size,
             max_waiting_requests,
             cache,
@@ -109,11 +121,16 @@ impl Scheduler {
         }
     }
 
+    pub fn tokens_per_second(&self) -> f64 {
+        self.token_rate.tokens_per_second()
+    }
+
     pub fn metrics(&self) -> SchedulerMetrics {
         SchedulerMetrics {
             queue_depth: self.queue_depth(),
             active_count: self.active_count(),
             avg_latency_ms: self.avg_latency_ms(),
+            execution: self.execution.lock().clone(),
         }
     }
 
@@ -122,6 +139,17 @@ impl Scheduler {
         request_id: RequestId,
         prompt: String,
         sampling: SamplingParams,
+    ) -> Result<mpsc::Receiver<TokenEvent>, EngineError> {
+        self.submit_with_permit(request_id, prompt, sampling, None)
+            .await
+    }
+
+    pub async fn submit_with_permit(
+        &self,
+        request_id: RequestId,
+        prompt: String,
+        sampling: SamplingParams,
+        client_permit: Option<Arc<crate::core::client_limits::ClientPermit>>,
     ) -> Result<mpsc::Receiver<TokenEvent>, EngineError> {
         self.check_health()?;
         sampling.validate()?;
@@ -198,6 +226,8 @@ impl Scheduler {
             tx,
             terminal_permit,
             enqueued_at: Instant::now(),
+            trace: RequestTrace::new(self.execution.clone()),
+            client_permit,
         });
         drop(queue);
 
@@ -206,34 +236,76 @@ impl Scheduler {
     }
 
     pub fn start_loop(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        assert!(
+            !self.started.swap(true, Ordering::AcqRel),
+            "worker already started"
+        );
         let scheduler = Arc::clone(self);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let thread = std::thread::Builder::new()
+            .name("rlse-inference".into())
+            .spawn(move || {
+                let mut active = Vec::with_capacity(scheduler.max_batch_size);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("inference runtime")
+                        .block_on(scheduler.run_continuous_loop(&mut active));
+                }));
+                // Publish failure before cleanup so routing stops immediately.
+                scheduler.accepting.store(false, Ordering::Release);
+                if result.is_err() {
+                    scheduler.backend.mark_unhealthy();
+                }
+                scheduler.fail_remaining(&mut active);
+                let _ = done_tx.send(());
+            })
+            .expect("inference thread");
+        // Construct outside the future so even an unpolled supervisor shuts down.
+        struct StopOnDrop(Arc<Scheduler>);
+        impl Drop for StopOnDrop {
+            fn drop(&mut self) {
+                self.0.shutdown();
+            }
+        }
+        let stop = StopOnDrop(Arc::clone(self));
         tokio::spawn(async move {
-            scheduler.run_continuous_loop().await;
+            let _stop = stop;
+            let _ = done_rx.await;
+            let _ = thread.join();
         })
     }
 
-    async fn run_continuous_loop(&self) {
-        info!(
-            "Continuous batching scheduler loop started (max_batch_size={})",
-            self.max_batch_size
-        );
-        let mut active: Vec<ActiveSequence> = Vec::with_capacity(self.max_batch_size);
+    fn fail_remaining(&self, active: &mut Vec<ActiveSequence>) {
+        for mut seq in active.drain(..) {
+            self.backend.cancel_sequence(&seq.request_id);
+            self.cache.lock().release(&seq.request_id.0);
+            seq.send_terminal(TokenEvent::Error("Worker stopped".into()));
+        }
+        for mut item in self.queue.lock().drain(..) {
+            item.trace.finish(if item.tx.is_closed() {
+                Outcome::Cancelled
+            } else {
+                Outcome::Error
+            });
+            item.terminal_permit
+                .send(TokenEvent::Error("Worker stopped".into()));
+        }
+        self.active_count.store(0, Ordering::Relaxed);
+    }
 
+    async fn run_continuous_loop(&self, active: &mut Vec<ActiveSequence>) {
+        info!("Dedicated inference worker started");
         loop {
-            if !self.is_healthy() {
-                for mut seq in active.drain(..) {
-                    self.backend.cancel_sequence(&seq.request_id);
-                    self.cache.lock().release(&seq.request_id.0);
-                    seq.send_terminal(TokenEvent::Error(
-                        "Worker unavailable; restart required".into(),
-                    ));
-                }
-                for item in self.queue.lock().drain(..) {
-                    item.terminal_permit.send(TokenEvent::Error(
-                        "Worker unavailable; restart required".into(),
-                    ));
-                }
-                self.active_count.store(0, Ordering::Relaxed);
+            let deadline = *self.drain_deadline.lock();
+            if !self.backend.is_healthy()
+                || (!self.accepting.load(Ordering::Acquire) && deadline.is_none())
+                || deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                || (!self.accepting.load(Ordering::Acquire)
+                    && active.is_empty()
+                    && self.queue.lock().is_empty())
+            {
                 break;
             }
             // Dynamic Admission: Admit waiting requests up to max_batch_size
@@ -244,7 +316,7 @@ impl Scheduler {
                 };
 
                 match item {
-                    Some(item) => {
+                    Some(mut item) => {
                         if item.tx.is_closed() {
                             debug!("Skipping cancelled request {}", item.request_id);
                             continue;
@@ -260,24 +332,16 @@ impl Scheduler {
                             self.record_failure(&err);
                             // Backends may have partially prepared request state.
                             self.backend.cancel_sequence(&item.request_id);
+                            item.trace.finish(Outcome::Error);
                             item.terminal_permit
                                 .send(TokenEvent::Error(err.to_string()));
-                            if !self.is_healthy() {
+                            if !self.accepting.load(Ordering::Acquire)
+                                && self.drain_deadline.lock().is_none()
+                                || !self.backend.is_healthy()
+                            {
                                 break;
                             }
                             continue;
-                        }
-
-                        // Check prefix cache for reuse
-                        {
-                            let mut pc = self.prefix_cache.lock();
-                            let matched = pc.lookup(&prompt_tokens);
-                            if matched.matched_tokens > 0 {
-                                debug!(
-                                    "Prefix cache hit for {}: {} tokens reused",
-                                    item.request_id, matched.matched_tokens
-                                );
-                            }
                         }
 
                         // Allocate initial KV cache blocks for prompt tokens
@@ -295,6 +359,9 @@ impl Scheduler {
                                     item.sampling,
                                     item.tx,
                                 );
+                                item.trace.admitted();
+                                seq.trace = Some(item.trace);
+                                seq.client_permit = item.client_permit;
                                 seq.terminal_permit = Some(item.terminal_permit);
                                 seq.created_at = item.enqueued_at;
                                 seq.prompt_tokens = prompt_tokens;
@@ -304,6 +371,7 @@ impl Scheduler {
                             Err(err) => {
                                 self.backend.cancel_sequence(&item.request_id);
                                 warn!("Cache allocation failed for {}: {}", item.request_id, err);
+                                item.trace.finish(Outcome::Error);
                                 item.terminal_permit
                                     .send(TokenEvent::Error(err.to_string()));
                             }
@@ -313,7 +381,9 @@ impl Scheduler {
                 }
             }
 
-            if !self.is_healthy() {
+            if !self.backend.is_healthy()
+                || (!self.accepting.load(Ordering::Acquire) && self.drain_deadline.lock().is_none())
+            {
                 continue;
             }
             self.active_count.store(active.len(), Ordering::Relaxed);
@@ -383,7 +453,7 @@ impl Scheduler {
             }
 
             // Step Batch Forward Pass
-            let step_tokens: Vec<StepToken> = match self.backend.step_batch(&mut active).await {
+            let step_tokens: Vec<StepToken> = match self.backend.step_batch(active).await {
                 Ok(toks) => toks,
                 Err(err) => {
                     self.record_failure(&err);
@@ -405,6 +475,10 @@ impl Scheduler {
                     seq.ttft_duration = Some(seq.created_at.elapsed());
                 }
 
+                if let Some(trace) = &mut seq.trace {
+                    trace.token();
+                }
+                self.token_rate.record_tokens(1);
                 seq.output_tokens.push(step.token_id);
                 seq.output_text.push_str(&step.text);
 
@@ -489,9 +563,23 @@ impl Scheduler {
         info!("Continuous batching scheduler loop exited cleanly");
     }
 
-    pub fn shutdown(&self) {
+    /// Stop admission and drain accepted work until the deadline. In-flight
+    /// synchronous kernels cannot be interrupted; cleanup occurs between steps.
+    pub fn begin_drain(&self, timeout: Duration) {
+        let _queue = self.queue.lock();
         self.accepting.store(false, Ordering::Release);
+        let deadline = Instant::now() + timeout;
+        let mut current = self.drain_deadline.lock();
+        *current = Some(current.map_or(deadline, |old| old.min(deadline)));
         self.shutdown.notify_one();
+    }
+
+    pub fn has_capacity(&self) -> bool {
+        self.is_healthy() && self.queue_depth() < self.max_waiting_requests
+    }
+
+    pub fn shutdown(&self) {
+        self.begin_drain(Duration::ZERO);
     }
 }
 

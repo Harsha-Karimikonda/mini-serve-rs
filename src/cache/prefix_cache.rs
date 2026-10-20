@@ -123,7 +123,6 @@ impl PrefixCache {
     pub fn lookup(&mut self, tokens: &[u32]) -> PrefixMatch {
         let chunk_pairs = Self::compute_chunk_hashes(tokens, self.chunk_size);
         if chunk_pairs.is_empty() {
-            self.misses += 1;
             return PrefixMatch {
                 matched_tokens: 0,
                 chunk_hashes: Vec::new(),
@@ -148,12 +147,6 @@ impl PrefixCache {
         }
 
         let matched_tokens = matched_chunks * self.chunk_size;
-        if matched_tokens > 0 {
-            self.hits += 1;
-            self.tokens_saved += matched_tokens;
-        } else {
-            self.misses += 1;
-        }
 
         PrefixMatch {
             matched_tokens,
@@ -164,7 +157,6 @@ impl PrefixCache {
     pub fn lookup_kv(&mut self, tokens: &[u32]) -> Option<PrefixSnapshot> {
         let chunk_pairs = Self::compute_chunk_hashes(tokens, self.chunk_size);
         if chunk_pairs.is_empty() {
-            self.misses += 1;
             return None;
         }
 
@@ -198,13 +190,6 @@ impl PrefixCache {
             }
             // Each chained key authenticates its complete prefix. Intermediate
             // snapshots may have been evicted while a longer one remains.
-        }
-
-        if let Some(snapshot) = &longest_match {
-            self.hits += 1;
-            self.tokens_saved += snapshot.matched_tokens;
-        } else {
-            self.misses += 1;
         }
 
         longest_match
@@ -376,6 +361,16 @@ impl PrefixCache {
             },
         );
         self.lru_order.push_back(hash);
+    }
+
+    /// Record successful execution reuse, never speculative metadata lookups.
+    pub fn record_reuse(&mut self, skipped_tokens: usize) {
+        if skipped_tokens == 0 {
+            self.misses += 1;
+        } else {
+            self.hits += 1;
+            self.tokens_saved += skipped_tokens;
+        }
     }
 
     pub fn stats(&self) -> (usize, usize, usize) {

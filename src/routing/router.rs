@@ -46,7 +46,7 @@ impl Router {
     pub fn choose_worker(&self) -> Result<&WorkerHandle, EngineError> {
         self.workers
             .iter()
-            .filter(|worker| worker.scheduler.is_healthy())
+            .filter(|worker| worker.scheduler.has_capacity())
             .min_by(|a, b| a.score().total_cmp(&b.score()))
             .ok_or_else(|| EngineError::NoHealthyWorkers("No ready execution paths".into()))
     }
@@ -57,8 +57,8 @@ impl Router {
         prompt: String,
         sampling: SamplingParams,
     ) -> Result<mpsc::Receiver<TokenEvent>, EngineError> {
-        let worker = self.choose_worker()?;
-        worker.scheduler.submit(request_id, prompt, sampling).await
+        self.submit_candidates(None, request_id, prompt, sampling, None)
+            .await
     }
 
     /// Loaded identities remain discoverable even when execution is quarantined.
@@ -99,10 +99,58 @@ impl Router {
         prompt: String,
         sampling: SamplingParams,
     ) -> Result<mpsc::Receiver<TokenEvent>, EngineError> {
-        self.worker_for_model(model)?
-            .scheduler
-            .submit(request_id, prompt, sampling)
+        self.submit_model_with_permit(model, request_id, prompt, sampling, None)
             .await
+    }
+
+    pub async fn submit_model_with_permit(
+        &self,
+        model: &str,
+        request_id: RequestId,
+        prompt: String,
+        sampling: SamplingParams,
+        permit: Option<Arc<crate::core::client_limits::ClientPermit>>,
+    ) -> Result<mpsc::Receiver<TokenEvent>, EngineError> {
+        self.worker_for_model(model)?;
+        self.submit_candidates(Some(model), request_id, prompt, sampling, permit)
+            .await
+    }
+
+    async fn submit_candidates(
+        &self,
+        model: Option<&str>,
+        request_id: RequestId,
+        prompt: String,
+        sampling: SamplingParams,
+        permit: Option<Arc<crate::core::client_limits::ClientPermit>>,
+    ) -> Result<mpsc::Receiver<TokenEvent>, EngineError> {
+        let mut workers: Vec<_> = self
+            .workers
+            .iter()
+            .filter(|w| model.is_none_or(|m| w.scheduler.backend().name() == m))
+            .filter(|w| w.scheduler.is_healthy())
+            .collect();
+        workers.sort_by(|a, b| a.score().total_cmp(&b.score()));
+        let mut error = EngineError::NoHealthyWorkers("No ready execution paths".into());
+        for worker in workers {
+            match worker
+                .scheduler
+                .submit_with_permit(
+                    request_id.clone(),
+                    prompt.clone(),
+                    sampling.clone(),
+                    permit.clone(),
+                )
+                .await
+            {
+                Ok(rx) => return Ok(rx),
+                Err(err @ (EngineError::AdmissionError(_) | EngineError::NoHealthyWorkers(_))) => {
+                    error = err
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Err(error)
     }
 
     pub async fn submit_chat(
@@ -112,10 +160,38 @@ impl Router {
         messages: &[crate::core::types::ChatMessage],
         sampling: SamplingParams,
     ) -> Result<mpsc::Receiver<TokenEvent>, EngineError> {
+        self.submit_chat_with_permit(model, request_id, messages, sampling, None)
+            .await
+    }
+
+    pub async fn submit_chat_with_permit(
+        &self,
+        model: &str,
+        request_id: RequestId,
+        messages: &[crate::core::types::ChatMessage],
+        sampling: SamplingParams,
+        permit: Option<Arc<crate::core::client_limits::ClientPermit>>,
+    ) -> Result<mpsc::Receiver<TokenEvent>, EngineError> {
         crate::backends::chat::validate_messages(messages)?;
         let worker = self.worker_for_model(model)?;
         let prompt = worker.scheduler.backend().format_chat(messages)?;
-        worker.scheduler.submit(request_id, prompt, sampling).await
+        self.submit_candidates(Some(model), request_id, prompt, sampling, permit)
+            .await
+    }
+
+    pub fn execution_stats(&self) -> crate::telemetry::metrics::ExecutionStats {
+        let mut stats = crate::telemetry::metrics::ExecutionStats::default();
+        for worker in &self.workers {
+            stats += worker.scheduler.metrics().execution;
+        }
+        stats
+    }
+
+    pub fn tokens_per_second(&self) -> f64 {
+        self.workers
+            .iter()
+            .map(|w| w.scheduler.tokens_per_second())
+            .sum()
     }
 
     pub fn all_metrics(&self) -> Vec<(String, SchedulerMetrics)> {

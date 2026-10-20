@@ -4,18 +4,166 @@ Completed changes must include an actual GPU inference run, in addition to CPU
 regressions and feature builds. This project rule is recorded in [AGENTS.md](../AGENTS.md).
 If GPU access or weights are unavailable, GPU verification stays pending.
 
-## Current change awaiting verification (2026-10-20)
+## Pre-commit verification: 2026-10-20
 
-Chat formatting and model identity have changed since the recorded Metal runs.
-Their GPU gate is **pending**; historical passes do not validate this change.
-The gate now supports explicit Metal/CUDA selection and chat comparisons;
-see [current commands and blockers](chat_correctness.md#gpu-gate-and-colabcuda).
-Local runs also need `tokenizer_config.json` alongside the original artifacts.
+This run covers the client quota, execution telemetry, SSE benchmark, prefix
+accounting, worker/shutdown changes, and the independent generation reference.
+The Colab notebook now lives at
+[`colab_cuda_kernels/test_colab.ipynb`](colab_cuda_kernels/test_colab.ipynb);
+its README links were updated and its JSON parses (six cells). Relocation does
+not constitute a new CUDA execution result.
+
+Hardware/model identity: Apple M4; explicit actual device
+`Metal(MetalDevice(DeviceId(1)))`; local `models/Qwen3-0.6B`, pinned revision
+`c1899de289a04d12100db370d81485cdf75e47ca`. The four artifact SHA-256 values
+were rechecked and match the table below. GPU weights use F16; debug/test build,
+Candle 0.11. Sampling is greedy, temperature 0, top-p 1. The main integration
+probe uses the token limits described below; independent generation uses at
+most 32 tokens per case. CPU fixture generation uses Transformers 4.57.1,
+PyTorch 2.8.0, CPU/F32 eager attention, four threads, and no sampling.
+
+Exact commands (CPU socket tests and GPU runs require host access):
+
+```bash
+export CARGO_HOME=/private/tmp/rlse-cargo
+export RUSTUP_HOME=/private/tmp/rlse-rustup
+export PATH="$CARGO_HOME/bin:$PATH"
+/private/tmp/rlse-reference/bin/python tests/fixtures/generation/generate_reference.py --model models/Qwen3-0.6B
+shasum -a 256 models/Qwen3-0.6B/*
+cargo fmt --all --check
+cargo test --locked --all-targets
+cargo clippy --locked --all-targets -- -D warnings
+cargo clippy --locked --features metal --all-targets -- -D warnings
+RLSE_GPU_DEVICE=metal RLSE_GPU_MODEL_DIR=models/Qwen3-0.6B cargo test --locked --features metal --test test_gpu_inference --test test_pretrained_quality -- --ignored --nocapture
+cargo build --locked --features metal --bin rlse --example bench
+python3 scripts/validate_gpu_server.py --device metal --model models/Qwen3-0.6B --output /private/tmp/rlse-commit-server.log
+git diff --check
+```
+
+CPU: **75 passed**, zero failed, two opt-in tests ignored. Formatting and both
+Clippy configurations passed. The initial sandbox CPU run could not bind local
+sockets for process tests; the host rerun passed all three process shutdown
+regressions (idle Ctrl-C, active HTTP stream draining, and zero deadline).
+The new reference test needed a concrete message-vector type annotation and its
+missing generated JSON fixture; both are included in this commit.
+
+GPU integration: **1 passed** in 39.12 seconds, including quota 429/isolation/
+disconnect cleanup, prefix equivalence and truthful saved-token counters,
+authenticated JSON/SSE, stops/EOS, worker draining, reservations, and injected
+returned-error quarantine. Final execution counters: 31 accepted, 27 completed,
+2 errors, 2 cancellations, 279 generated tokens. All active/prefix reservations
+and logical blocks were released; fixed headroom remains 33,554,432 bytes,
+peak reservation 188,183,808 bytes. These are accounting estimates.
+
+Independent reference GPU test: **1 passed** in 5.14 seconds. All four cases
+match independently generated CPU/F32 token IDs and text exactly: instruction
+(`Paris.`, 7 tokens), role context (`cobalt`, 7), Spanish (`Hola`, 6), and stop
+(`red green blue.`, 9; visible suffix `red` after the configured stop). Counts
+include thinking delimiters and EOS. Default thinking delimiters remain in
+visible output. This is a four-case regression, not a broad quality evaluation.
+Real HTTP GPU server: three rounds each of warm/cold prefix benchmarks, one
+warmup per mode, concurrency 2, and 12-token limits passed. All warm rounds
+saved prefix tokens; cold rounds saved zero. After benchmarking: 14 accepted,
+14 completed, 168 generated tokens, zero errors/cancellations and zero allocated
+logical blocks. Ctrl-C after the first SSE token drained the 12-token request
+and exited with status 0 in 1.613 seconds. The validator now explicitly sets
+`RUST_LOG=rlse=info` so an inherited warning-only filter cannot hide its required
+actual-device startup evidence; the initial attempt lacked that log line.
+
+CUDA pretrained inference, numeric logit tolerances, forced driver OOM/hangs,
+production load, and hosted CI remain unverified. Timings are correctness-run
+durations and do not establish throughput.
+
+## Verified current working tree: 2026-10-20
+
+The explicit Metal gate passed after downloading the pinned local artifacts.
+This supersedes the earlier missing-weights blockers in the chat/worker records.
+
+- Hardware: Apple M4, 8 GPU cores, 16 GB unified memory, Mac16,2.
+- Actual device asserted and printed: `Metal(MetalDevice(DeviceId(1)))`.
+- Model: `Qwen/Qwen3-0.6B`, revision
+  `c1899de289a04d12100db370d81485cdf75e47ca`, directory `models/Qwen3-0.6B`.
+- Build: debug/test, Candle 0.11, `--locked --features metal`, F16 weights.
+- Sampling: temperature 0, top-p 1, 12 output tokens for completion/chat,
+  prefix/worker comparisons; EOS probe 32; cancellation probe 512; reservation
+  rejection probe 4000; returned-error probe 128. These are token limits, not
+  necessarily actual generated counts.
+- Result: **1 passed, zero failed, zero ignored**, 53.41 seconds (53.374 seconds
+  inside the test including initialization). Concurrent CPU checks ran during
+  this correctness test; this duration is not a performance measurement.
+
+Artifact SHA-256:
+
+| File | SHA-256 |
+| --- | --- |
+| `config.json` | `660db3b73d788119c04535e48cf9be5f55bc3100841a718637ae695b442f27dd` |
+| `tokenizer.json` | `aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4` |
+| `tokenizer_config.json` | `d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101` |
+| `model.safetensors` | `f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b` |
+
+Exact setup/download and verification commands (weights are gitignored):
+
+```bash
+mkdir -p models/Qwen3-0.6B
+for artifact in config.json tokenizer.json tokenizer_config.json model.safetensors; do
+  curl -fL --retry 2 "https://huggingface.co/Qwen/Qwen3-0.6B/resolve/c1899de289a04d12100db370d81485cdf75e47ca/$artifact" -o "models/Qwen3-0.6B/$artifact"
+done
+shasum -a 256 models/Qwen3-0.6B/*
+system_profiler SPDisplaysDataType SPHardwareDataType
+export CARGO_HOME=/private/tmp/rlse-cargo
+export RUSTUP_HOME=/private/tmp/rlse-rustup
+export PATH="$CARGO_HOME/bin:$PATH"
+cargo fmt --all --check
+cargo test --locked --all-targets
+cargo clippy --locked --all-targets -- -D warnings
+cargo clippy --locked --features metal --all-targets -- -D warnings
+cargo test --locked --features metal --all-targets
+RLSE_GPU_DEVICE=metal RLSE_GPU_MODEL_DIR=models/Qwen3-0.6B cargo test --locked --features metal --test test_gpu_inference -- --ignored --nocapture
+git diff --check
+```
+
+Network downloads and the GPU command used approved host access. Normal CPU and
+Metal-feature suites each passed **62 tests**; two/three opt-in tests respectively
+were ignored. Both Clippy configurations, formatting, and diff checks passed.
+The explicit GPU command executes the normally ignored gate and rejects CPU
+fallback; normal suite passes alone are not GPU evidence.
+
+New observed checks:
+
+- [Authentication](api_authentication.md): missing credentials on completion and
+  chat receive 401 before parsing malformed JSON and without increasing reserved
+  bytes. Valid bearer credentials work on JSON and SSE for both routes. Output
+  equals direct greedy execution; terminal delivery and allocation cleanup pass.
+  CPU regressions additionally cover all protected/public routes and invalid keys.
+- [Chat formatting](chat_correctness.md): local template and nine-token `Hello`
+  prompt match pinned Transformers reference text/token IDs. JSON/SSE chat output
+  equals direct inference on that reference prompt. Output is
+  `<think>\nOkay, the user just said "Hello". I`, with 9 input, 12 output, and
+  21 total tokens, finish reason `length`. This model's default thinking template
+  remains enabled; this is protocol/template correctness, not broad quality.
+- [Worker lifecycle](worker_lifecycle.md): a dedicated inference worker drains
+  accepted 12-token greedy work, matches isolated output, rejects new admission,
+  serves five HTTP health probes within 250 ms each, joins, and releases active
+  reservations and logical blocks.
+- Existing exact/partial/missing-logit prefix comparisons, stops, EOS, concurrent
+  workers, cancellation, budget rejection/recovery, and injected returned-error
+  quarantine all passed again. Baseline France output remains
+  ` Paris. The capital of Italy is Rome. The capital of` (5 input/12 output).
+
+Peak reserved bytes were 188,183,808 within a 536,870,912-byte budget. Active KV,
+execution, and prefix charges ended at zero, leaving 33,554,432 bytes of fixed
+headroom; one reservation was rejected. These are estimates, not allocator/RSS
+measurements. GPU chat is compared with direct inference using independently
+pinned formatting/token IDs, not independently generated reference-model logits.
+CUDA, broad output quality, numeric GPU logit tolerances, forced driver OOM,
+process-signal/deadline integration, production load, hosted CI, and a validating
+commit remain unverified/unrecorded. Historical runs below retain their original
+scope and counts.
 
 ## Repeatable check
 
 Prerequisites: macOS with a Metal GPU and local `config.json`, `tokenizer.json`,
-and `model.safetensors` in `models/Qwen3-0.6B`.
+`tokenizer_config.json`, and `model.safetensors` in `models/Qwen3-0.6B`.
 
 ```bash
 cargo test --locked --features metal --test test_gpu_inference -- --ignored --nocapture

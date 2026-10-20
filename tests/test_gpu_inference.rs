@@ -225,7 +225,8 @@ async fn pretrained_gpu_memory_prefix_stops_and_workers() {
             .map(|(i, w)| WorkerHandle::new(format!("gpu-{i}"), w.clone()))
             .collect(),
     ));
-    let app = create_app(AppState {
+    let observed_router = router.clone();
+    let state = AppState {
         router,
         cache: cache.clone(),
         prefix_cache: prefix.clone(),
@@ -237,10 +238,95 @@ async fn pretrained_gpu_memory_prefix_stops_and_workers() {
             execution_headroom_bytes: 32 * 1024 * 1024,
             ..Settings::default()
         },
-    });
+    };
+    let app = create_app(state.clone());
+    let mut authenticated_state = state;
+    authenticated_state.settings.api_key = Some("gpu-regression-key".into());
+    authenticated_state.settings.api_keys = vec!["gpu-other-client".into()];
+    authenticated_state.settings.client_max_concurrent = 1;
+    let authenticated = create_app(authenticated_state);
 
     let plain = generate(&workers[0], PROMPT, 12).await;
     assert!(plain.text.to_lowercase().contains("paris"));
+    let stats = observed_router.execution_stats();
+    assert_eq!(
+        (
+            stats.accepted,
+            stats.completed,
+            stats.errors,
+            stats.cancellations,
+            stats.generated_tokens,
+            stats.queue_delay_count,
+            stats.ttft_count
+        ),
+        (1, 1, 0, 0, 12, 1, 1)
+    );
+    let quota_request = |key: &str, max_tokens: usize| {
+        Request::builder().method("POST").uri("/v1/completions")
+            .header("authorization", format!("Bearer {key}"))
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"model": model_dir, "prompt": PROMPT, "temperature": 0, "top_p": 1, "max_tokens": max_tokens, "stream": true}).to_string())).unwrap()
+    };
+    let held = authenticated
+        .clone()
+        .oneshot(quota_request("gpu-regression-key", 128))
+        .await
+        .unwrap();
+    assert!(held.status().is_success());
+    let rejected = authenticated
+        .clone()
+        .oneshot(quota_request("gpu-regression-key", 12))
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(rejected.headers()["retry-after"], "1");
+    let other = authenticated
+        .clone()
+        .oneshot(quota_request("gpu-other-client", 12))
+        .await
+        .unwrap();
+    assert!(other.status().is_success());
+    drop(held);
+    let body = other.into_body().collect().await.unwrap().to_bytes();
+    let mut parser = rlse::sse::CompletionStream::default();
+    for byte in body.chunks(1) {
+        parser.push(byte).unwrap();
+    }
+    assert_eq!(parser.finish().unwrap(), 12);
+    assert_eq!(parser.completion_tokens, Some(12));
+    let sse = std::str::from_utf8(&body).unwrap();
+    assert!(sse.ends_with("data: [DONE]\n\n"));
+    let other_text = sse
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| {
+            let chunk: Value = serde_json::from_str(data).unwrap();
+            chunk["choices"][0]["text"].as_str().unwrap().to_owned()
+        })
+        .collect::<String>();
+    assert_eq!(other_text, plain.text);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while workers
+            .iter()
+            .any(|w| w.active_count() != 0 || w.queue_depth() != 0)
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let recovered = authenticated
+        .clone()
+        .oneshot(quota_request("gpu-regression-key", 12))
+        .await
+        .unwrap();
+    assert!(recovered.status().is_success());
+    let bytes = recovered.into_body().collect().await.unwrap().to_bytes();
+    assert!(std::str::from_utf8(&bytes)
+        .unwrap()
+        .ends_with("data: [DONE]\n\n"));
+    println!("PASS: per-client GPU concurrency quota returns 429, isolates a second credential, and releases after disconnect/cleanup");
     let mut aligned = PROMPT.to_owned();
     while model.init_sequence(&aligned).await.unwrap().len() < 32 {
         aligned.push_str(" France");
@@ -249,15 +335,24 @@ async fn pretrained_gpu_memory_prefix_stops_and_workers() {
     prefix.lock().clear();
     let reference = generate(&workers[0], &aligned, 12).await;
     assert!(budget.stats().prefix_retained_bytes > 0);
-    let saved = prefix.lock().stats().2;
+    let before_exact = prefix.lock().stats();
+    let saved = before_exact.2;
     let exact = generate(&workers[0], &aligned, 12).await;
     assert_eq!(exact.text, reference.text, "exact cached output diverged");
-    assert!(prefix.lock().stats().2 >= saved + 32);
+    assert_eq!(
+        prefix.lock().stats(),
+        (before_exact.0 + 1, before_exact.1, saved + 32)
+    );
     let extended = format!("{aligned} and Italy");
     prefix.lock().clear();
     let extended_reference = generate(&workers[0], &extended, 12).await;
     // The 32-token snapshot from a longer prompt has no saved logits.
+    let before_replay = prefix.lock().stats();
     let replay = generate(&workers[0], &aligned, 12).await;
+    assert_eq!(
+        prefix.lock().stats(),
+        (before_replay.0 + 1, before_replay.1, before_replay.2 + 31)
+    );
     assert_eq!(replay.text, reference.text, "missing-logit replay diverged");
     prefix.lock().clear();
     generate(&workers[0], &aligned, 12).await;
@@ -266,7 +361,7 @@ async fn pretrained_gpu_memory_prefix_stops_and_workers() {
         partial.text, extended_reference.text,
         "partial prefix output diverged"
     );
-    println!("PASS: exact prefix with logits, exact prefix without logits, partial prefix outputs match uncached reference");
+    println!("PASS: exact prefix with logits, exact prefix without logits, partial prefix outputs match uncached reference; reuse counters count once and replay saves 31 rather than 32 tokens");
 
     let fixture: Value =
         serde_json::from_str(include_str!("fixtures/chat/qwen3-reference.json")).unwrap();
@@ -286,6 +381,88 @@ async fn pretrained_gpu_memory_prefix_stops_and_workers() {
         "local chat metadata must match the pinned reference fixture"
     );
     let chat_reference = generate(&workers[0], reference_prompt, 12).await;
+    for path in ["/v1/completions", "/v1/chat/completions"] {
+        let before = budget.stats().reserved_bytes;
+        let rejected = authenticated
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from("invalid JSON"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(budget.stats().reserved_bytes, before);
+        for stream in [false, true] {
+            let response = authenticated
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .header("authorization", "Bearer gpu-regression-key")
+                        .body(Body::from(
+                            json!({"model":model_dir, "prompt":PROMPT,
+                    "messages":case["messages"], "temperature":0, "top_p":1,
+                    "max_tokens":12, "stream":stream})
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(response.status().is_success());
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let is_chat = path.contains("chat");
+            let text = if stream {
+                let sse = std::str::from_utf8(&body).unwrap();
+                assert!(sse.ends_with("data: [DONE]\n\n"));
+                sse.lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter(|data| *data != "[DONE]")
+                    .map(|data| {
+                        let chunk: Value = serde_json::from_str(data).unwrap();
+                        assert!(chunk.get("error").is_none());
+                        if is_chat {
+                            chunk["choices"][0]["delta"]["content"]
+                                .as_str()
+                                .unwrap_or("")
+                                .to_owned()
+                        } else {
+                            chunk["choices"][0]["text"].as_str().unwrap().to_owned()
+                        }
+                    })
+                    .collect::<String>()
+            } else {
+                let result: Value = serde_json::from_slice(&body).unwrap();
+                if is_chat {
+                    result["choices"][0]["message"]["content"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                } else {
+                    result["choices"][0]["text"].as_str().unwrap().to_owned()
+                }
+            };
+            assert_eq!(
+                text,
+                if is_chat {
+                    &chat_reference.text
+                } else {
+                    &plain.text
+                }
+                .as_str()
+            );
+            assert_eq!(cache.lock().allocated_count(), 0);
+            assert_eq!(budget.stats().active_kv_reserved_bytes, 0);
+        }
+    }
+    println!("PASS: authenticated JSON/SSE completion and chat match direct GPU greedy output; missing credentials reject before parsing/reservation");
     for stream in [false, true] {
         let response = app
             .clone()
@@ -465,6 +642,51 @@ async fn pretrained_gpu_memory_prefix_stops_and_workers() {
     assert_eq!(recovered.text, plain.text);
     assert_eq!(cache.lock().allocated_count(), 0);
     assert!(workers.iter().all(|w| w.is_healthy()));
+    let draining = Arc::new(Scheduler::new(
+        1,
+        2,
+        cache.clone(),
+        prefix.clone(),
+        fault.clone(),
+    ));
+    let accepted = draining
+        .submit(RequestId::new_completion(), PROMPT.into(), sampling(12))
+        .await
+        .unwrap();
+    draining.begin_drain(Duration::from_secs(30));
+    let drain_task = draining.start_loop();
+    assert!(draining
+        .submit(RequestId::new_completion(), PROMPT.into(), sampling(12))
+        .await
+        .is_err());
+    let (result, ()) = tokio::join!(collect(accepted), async {
+        for _ in 0..5 {
+            let response = tokio::time::timeout(
+                Duration::from_millis(250),
+                app.clone().oneshot(
+                    Request::builder()
+                        .uri("/health")
+                        .body(Body::empty())
+                        .unwrap(),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(response.status().is_success());
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    });
+    assert_eq!(result.text, plain.text);
+    tokio::time::timeout(Duration::from_secs(30), drain_task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!draining.is_healthy());
+    assert_eq!(draining.active_count(), 0);
+    assert_eq!(budget.stats().active_kv_reserved_bytes, 0);
+    assert_eq!(cache.lock().allocated_count(), 0);
+    println!("PASS: dedicated GPU worker drains accepted greedy generation, rejects admission, joins, and keeps HTTP responsive");
     fault.remaining.store(2, Ordering::SeqCst);
     let response = app.clone().oneshot(Request::builder().method("POST").uri("/v1/completions")
         .header("content-type", "application/json")
@@ -526,6 +748,14 @@ async fn pretrained_gpu_memory_prefix_stops_and_workers() {
     for handle in handles {
         handle.await.unwrap();
     }
+    let execution = observed_router.execution_stats();
+    assert_eq!(
+        execution.accepted,
+        execution.completed + execution.errors + execution.cancellations
+    );
+    assert!(execution.errors >= 2);
+    assert!(execution.cancellations >= 1);
+    println!("PASS: scheduler execution telemetry counts real tokens and exactly one outcome per accepted GPU request: {execution:?}");
     prefix.lock().clear();
     assert_eq!(budget.stats().reserved_bytes, budget.stats().headroom_bytes);
     println!("PASS: budget rejection evicts prefixes, reclaims state, and subsequent GPU inference succeeds; stats={:?}; elapsed={:?}", budget.stats(), started.elapsed());

@@ -84,9 +84,12 @@ impl ModelBackend for FaultBackend {
         }
     }
     async fn step_batch(&self, seqs: &mut [ActiveSequence]) -> Result<Vec<StepToken>, EngineError> {
+        let release = self.release_failure.notified();
+        tokio::pin!(release);
+        release.as_mut().enable();
         self.forwards.fetch_add(1, Ordering::SeqCst);
         if self.mode.load(Ordering::SeqCst) == 4 {
-            self.release_failure.notified().await;
+            release.await;
             return Err(EngineError::BackendError(
                 "injected shared device failure".into(),
             ));
@@ -243,7 +246,7 @@ async fn shared_failure_drains_active_and_queued_work_on_both_workers() {
             }
         }
         let handles: Vec<_> = workers.iter().map(Scheduler::start_loop).collect();
-        while backend.live.lock().len() != 2 {
+        while backend.forwards.load(Ordering::SeqCst) != 2 {
             tokio::task::yield_now().await;
         }
         assert_eq!(cache.lock().allocated_count(), 2);

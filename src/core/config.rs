@@ -1,6 +1,6 @@
 use clap::Parser;
 
-#[derive(Parser, Debug, Clone)]
+#[derive(Parser, Clone)]
 #[command(
     author,
     version,
@@ -41,13 +41,37 @@ pub struct Settings {
     #[arg(long, env = "RLSE_NUM_WORKERS", default_value_t = 1)]
     pub num_workers: usize,
 
+    #[arg(long, env = "RLSE_SHUTDOWN_TIMEOUT_MS", default_value_t = 30_000)]
+    pub shutdown_timeout_ms: u64,
+
     #[arg(long, env = "RLSE_ALLOW_MOCK_FALLBACK", default_value_t = false)]
     pub allow_mock_fallback: bool,
 
     #[arg(long, env = "RLSE_LOG_LEVEL", default_value = "info")]
     pub log_level: String,
 
-    #[arg(long, env = "HF_TOKEN")]
+    /// Optional shared bearer key for protected HTTP routes. Prefer the environment variable.
+    #[arg(long, env = "RLSE_API_KEY", hide_env_values = true)]
+    pub api_key: Option<String>,
+
+    /// Additional independent client credentials (comma-separated in the environment).
+    #[arg(
+        long,
+        env = "RLSE_API_KEYS",
+        value_delimiter = ',',
+        hide_env_values = true
+    )]
+    pub api_keys: Vec<String>,
+
+    /// Accepted generation attempts per client per fixed 60-second window; zero disables.
+    #[arg(long, env = "RLSE_CLIENT_REQUESTS_PER_MINUTE", default_value_t = 0)]
+    pub client_requests_per_minute: usize,
+
+    /// Queued and active generations per client; zero disables.
+    #[arg(long, env = "RLSE_CLIENT_MAX_CONCURRENT", default_value_t = 0)]
+    pub client_max_concurrent: usize,
+
+    #[arg(long, env = "HF_TOKEN", hide_env_values = true)]
     pub hf_token: Option<String>,
 }
 
@@ -65,11 +89,16 @@ impl Default for Settings {
             kv_cache_blocks: DEFAULT_KV_CACHE_BLOCKS,
             block_size: DEFAULT_BLOCK_SIZE,
             num_workers: 1,
+            shutdown_timeout_ms: 30_000,
             tensor_memory_budget_bytes: crate::cache::tensor_memory::DEFAULT_TENSOR_MEMORY_BUDGET,
             execution_headroom_bytes: crate::cache::tensor_memory::DEFAULT_EXECUTION_HEADROOM,
             allow_mock_fallback: false,
             log_level: "info".to_string(),
             hf_token: None,
+            api_key: None,
+            api_keys: Vec::new(),
+            client_requests_per_minute: 0,
+            client_max_concurrent: 0,
         }
     }
 }
@@ -106,6 +135,21 @@ impl Settings {
             self.tensor_memory_budget_bytes,
             self.execution_headroom_bytes,
         )?;
+        if self.api_keys.len() + usize::from(self.api_key.is_some()) > 128 {
+            return Err(EngineError::InvalidRequest(
+                "At most 128 API keys are supported".into(),
+            ));
+        }
+        if self
+            .api_key
+            .iter()
+            .chain(&self.api_keys)
+            .any(|key| key.is_empty() || !key.bytes().all(|b| b.is_ascii_graphic()))
+        {
+            return Err(EngineError::InvalidRequest(
+                "api_key must contain only nonempty printable ASCII without whitespace".into(),
+            ));
+        }
         validate_device(&self.device)
     }
 }
@@ -123,5 +167,21 @@ pub fn validate_device(device: &str) -> Result<(), crate::core::errors::EngineEr
         Err(crate::core::errors::EngineError::InvalidRequest(format!(
             "Unsupported device '{device}'; use auto, cpu, or an accelerator enabled at build time"
         )))
+    }
+}
+
+// Credentials must never appear in diagnostics, including Debug output.
+impl std::fmt::Debug for Settings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Settings")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("model", &self.model)
+            .field("device", &self.device)
+            .field(
+                "authentication_enabled",
+                &(self.api_key.is_some() || !self.api_keys.is_empty()),
+            )
+            .finish_non_exhaustive()
     }
 }

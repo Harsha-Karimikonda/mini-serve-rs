@@ -440,6 +440,7 @@ impl ModelBackend for CandleBackend {
                         None
                     };
 
+                    let mut skipped_tokens = 0;
                     let last_logits = if let Some(ref snapshot) = matched_kv {
                         let matched_tokens = snapshot.matched_tokens();
                         let cached_logits = snapshot.logits().cloned();
@@ -452,6 +453,7 @@ impl ModelBackend for CandleBackend {
                         } else {
                             matched_tokens
                         };
+                        skipped_tokens = restored_tokens;
                         let snapshot_pairs: Vec<(Tensor, Tensor)> = snapshot
                             .layers()
                             .iter()
@@ -547,6 +549,10 @@ impl ModelBackend for CandleBackend {
                             ))
                         })?
                     };
+
+                    if let Some(pc) = &self.prefix_cache {
+                        pc.lock().record_reuse(skipped_tokens);
+                    }
 
                     // Insert the completed prompt's KV into prefix_cache for future requests
                     if let Some(ref pc) = self.prefix_cache {
@@ -1200,7 +1206,13 @@ mod correctness_tests {
         let mut prime = sequence("prime", tokens.clone());
         step(&cached, &mut prime).await;
         cached.cancel_sequence(&prime.request_id);
+        assert_eq!(pc.lock().stats(), (0, 1, 0));
         let before_snapshot = pc.lock().lookup_kv(&tokens).unwrap();
+        assert_eq!(
+            pc.lock().stats(),
+            (0, 1, 0),
+            "lookup alone must not count reuse"
+        );
         let before = before_snapshot.layers();
         let before_values: Vec<_> = before
             .iter()
@@ -1213,12 +1225,27 @@ mod correctness_tests {
             .collect();
         // The 16- and 32-token exact matches initially have no stored logits.
         for len in [16, 32, 15, 17, 31, 33, 16, 32] {
+            let before_stats = pc.lock().stats();
+            let snapshot = pc.lock().lookup_kv(&tokens[..len]);
+            let skipped = snapshot.as_ref().map_or(0, |s| {
+                s.matched_tokens() - usize::from(s.matched_tokens() == len && s.logits().is_none())
+            });
+            drop(snapshot);
             let mut actual = sequence("cached", tokens[..len].to_vec());
             let mut expected = sequence("plain", tokens[..len].to_vec());
             for _ in 0..5 {
                 step(&cached, &mut actual).await;
                 step(&plain, &mut expected).await;
             }
+            let after_stats = pc.lock().stats();
+            assert_eq!(
+                after_stats,
+                (
+                    before_stats.0 + usize::from(skipped > 0),
+                    before_stats.1 + usize::from(skipped == 0),
+                    before_stats.2 + skipped
+                )
+            );
             assert_eq!(actual.output_tokens, expected.output_tokens, "length {len}");
             // Compare final prompt logits numerically as well as greedy tokens.
             if len % 16 == 0 {

@@ -1,7 +1,12 @@
 # Chat formatting and model identity: 2026-10-20
 
-Implementation is present; **pretrained GPU verification is pending**. This
-change must not be marked GPU-verified based on the historical October 16 run.
+Implementation and focused pretrained Metal verification now pass. The
+2026-10-20 explicit GPU gate matched pinned template/token IDs and compared
+JSON/SSE chat with direct greedy generation on the reference-formatted prompt.
+See [current GPU evidence](gpu_validation.md#verified-current-working-tree-2026-10-20)
+for exact artifacts, commands, device, outputs, and limitations. Earlier
+missing-weights results below are historical; CUDA and broad output quality
+remain unverified.
 
 ## Behavior and interfaces
 

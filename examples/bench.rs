@@ -1,17 +1,9 @@
-//! Pure Rust Benchmark Harness for RLSE
-//!
-//! Run with:
-//! cargo run --example bench --features metal -- [OPTIONS]
-//!
-//! Example:
-//! cargo run --example bench --features metal -- --url http://127.0.0.1:8002 --model Qwen/Qwen2.5-0.5B-Instruct
-
-use clap::Parser;
+//! Repeatable HTTP completion benchmark with strict incremental SSE parsing.
+use clap::{Parser, ValueEnum};
 use futures_util::StreamExt;
-use serde_json::{json, Value};
-use std::time::Instant;
-
-const PROMPT_SHORT: &str = "Explain the theory of relativity in one short sentence.";
+use rlse::sse::CompletionStream;
+use serde_json::json;
+use std::time::{Duration, Instant};
 
 const PROMPT_MEDIUM: &str = "\
 In computer systems and distributed architectures, memory consistency models define \
@@ -25,262 +17,184 @@ processors such as Apple Silicon (ARMv8.5-A) and x86 implement relaxed memory mo
 speculative execution, and memory fences like DMB (Data Memory Barrier) dictate visibility. Please summarize \
 how modern hardware memory models trade off sequential consistency for instruction-level parallelism.";
 
-const PROMPT_LONG: &str = "\
-A continuous batching inference engine is designed to maximize GPU utilization when serving Large Language Models. \
-Traditional batching models wait for a fixed number of requests to arrive, pack them into a rectangular matrix tensor, \
-and execute forward passes until all sequences finish. This introduces substantial inefficiencies known as the 'head-of-line blocking' \
-and 'tail latency penalty', where shorter sequences sit idle while the longest sequence in the batch completes its generation. \
-Continuous batching (or iteration-level scheduling), pioneered by Orca and popularized by vLLM, transforms inference into a dynamic, \
-step-by-step iteration loop. At every decoding iteration, completed sequences that encounter an EOS token or reach their max_tokens \
-limit are immediately evicted, free KV-cache slots are reclaimed, and newly arrived waiting requests in the scheduling queue are admitted \
-dynamically without waiting for other streams to finish. \
-Paged KV-cache architectures further solve GPU memory fragmentation. Standard KV-caching pre-allocates contiguous virtual memory buffers \
-sized to the maximum possible sequence length (e.g. 2048 or 4096 tokens). In real-world workloads, actual output lengths exhibit high variance, \
-leading to internal fragmentation where 60% to 80% of VRAM is reserved for tokens that are never generated. By segmenting the Key and Value cache \
-into non-contiguous, fixed-size physical blocks (e.g. 16 tokens per block), the engine dynamically maps logical tokens to physical block IDs through \
-a page table, mirroring OS virtual memory management. \
-Prefix caching builds on this abstraction: when multiple prompts share common prefixes (such as system instructions, few-shot examples, \
-or document contexts in Retrieval-Augmented Generation), the engine hashes 16-token chunks using cryptographic hashing (such as SHA-256) \
-and stores the computed Key-Value activations in an LRU prefix cache. Subsequent requests sharing that prefix can bypass prefill computation \
-entirely, jumping directly to decoding. \
-Furthermore, in production systems, cooperative client disconnect cancellation is vital: if an HTTP client drops its TCP connection, \
-the engine must immediately cease forward computation for that sequence, reclaim GPU blocks, and avoid wasting precious FLOPs. \
-Please analyze the architectural synergy between continuous batching, paged memory allocation, and zero-overhead systems programming.";
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum PrefixMode {
+    Warm,
+    Cold,
+}
 
-#[derive(Parser, Debug)]
-#[command(name = "rlse-bench", about = "Pure Rust benchmark harness for RLSE")]
+#[derive(Parser)]
+#[command(
+    name = "rlse-bench",
+    about = "Repeated HTTP benchmark; client timings include network and scheduling"
+)]
 struct Args {
     #[arg(long, default_value = "http://127.0.0.1:8002")]
     url: String,
-
-    #[arg(long, default_value = "Qwen/Qwen2.5-0.5B-Instruct")]
+    #[arg(long, default_value = "mock")]
     model: String,
+    #[arg(long, default_value = PROMPT_MEDIUM)]
+    prompt: String,
+    #[arg(long, default_value_t = 32)]
+    max_tokens: usize,
+    #[arg(long, default_value_t = 3)]
+    rounds: usize,
+    #[arg(long, default_value_t = 1)]
+    warmups: usize,
+    #[arg(long, default_value_t = 1)]
+    concurrency: usize,
+    #[arg(long, value_enum, default_value_t = PrefixMode::Warm)]
+    prefix_mode: PrefixMode,
+    #[arg(long, env = "RLSE_API_KEY", hide_env_values = true)]
+    api_key: Option<String>,
 }
 
 struct StreamResult {
-    total_tokens: usize,
+    tokens: usize,
     ttft_ms: f64,
-    total_latency_ms: f64,
-    tok_per_sec: f64,
-    sample_text: String,
+    latency_ms: f64,
+    end_to_end_tokens_per_sec: f64,
+    observed_decode_tokens_per_sec: Option<f64>,
+    authoritative_usage: bool,
 }
 
-async fn measure_pure_ttft(
+async fn measure(
     client: &reqwest::Client,
-    base_url: &str,
-    model: &str,
-    prompt: &str,
-) -> f64 {
-    let t0 = Instant::now();
-    let payload = json!({
-        "model": model,
-        "prompt": prompt,
-        "max_tokens": 1,
-        "stream": false
-    });
-
-    let res = client
-        .post(format!("{}/v1/completions", base_url))
-        .json(&payload)
-        .send()
-        .await;
-
-    match res {
-        Ok(resp) => {
-            let _ = resp.text().await;
-            t0.elapsed().as_secs_f64() * 1000.0
-        }
-        Err(e) => {
-            eprintln!("Error measuring TTFT: {}", e);
-            0.0
-        }
-    }
-}
-
-async fn measure_streaming(
-    client: &reqwest::Client,
-    base_url: &str,
+    url: &str,
     model: &str,
     prompt: &str,
     max_tokens: usize,
-) -> StreamResult {
-    let t0 = Instant::now();
-    let mut first_token_time = None;
-    let mut token_count = 0;
-    let mut text_acc = String::new();
-
-    let payload = json!({
-        "model": model,
-        "prompt": prompt,
-        "max_tokens": max_tokens,
-        "stream": true
-    });
-
-    let resp = client
-        .post(format!("{}/v1/completions", base_url))
-        .json(&payload)
-        .send()
-        .await;
-
-    if let Ok(response) = resp {
-        let mut stream = response.bytes_stream();
-        while let Some(chunk_res) = stream.next().await {
-            if let Ok(chunk) = chunk_res {
-                let text = String::from_utf8_lossy(&chunk);
-                for line in text.lines() {
-                    let line = line.trim();
-                    if !line.starts_with("data:") {
-                        continue;
-                    }
-                    let data = line[5..].trim();
-                    if data == "[DONE]" {
-                        break;
-                    }
-                    if let Ok(v) = serde_json::from_str::<Value>(data) {
-                        if let Some(txt) = v["choices"][0]["text"].as_str() {
-                            if first_token_time.is_none() {
-                                first_token_time = Some(t0.elapsed());
-                            }
-                            token_count += 1;
-                            text_acc.push_str(txt);
-                        }
-                    }
-                }
-            }
+) -> Result<StreamResult, String> {
+    let started = Instant::now();
+    let response = client.post(format!("{url}/v1/completions"))
+        .json(&json!({"model":model,"prompt":prompt,"max_tokens":max_tokens,"temperature":0,"top_p":1,"stream":true}))
+        .send().await.map_err(|e|e.to_string())?.error_for_status().map_err(|e|e.to_string())?;
+    if !response
+        .headers()
+        .get("content-type")
+        .and_then(|h| h.to_str().ok())
+        .is_some_and(|h| h.starts_with("text/event-stream"))
+    {
+        return Err("Expected text/event-stream".into());
+    }
+    let mut stream = response.bytes_stream();
+    let mut parser = CompletionStream::default();
+    let mut first = None;
+    let mut last = None;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| e.to_string())?;
+        let previous = parser.token_events;
+        parser.push(&chunk)?;
+        if parser.token_events > previous {
+            let now = started.elapsed();
+            first.get_or_insert(now);
+            last = Some(now);
         }
     }
-
-    let total_latency = t0.elapsed();
-    let total_latency_ms = total_latency.as_secs_f64() * 1000.0;
-    let ttft_ms = first_token_time.map_or(total_latency_ms, |d| d.as_secs_f64() * 1000.0);
-    let tok_per_sec = if total_latency.as_secs_f64() > 0.0 {
-        token_count as f64 / total_latency.as_secs_f64()
-    } else {
-        0.0
-    };
-
-    StreamResult {
-        total_tokens: token_count,
-        ttft_ms,
-        total_latency_ms,
-        tok_per_sec,
-        sample_text: text_acc,
-    }
-}
-
-async fn measure_concurrency(
-    client: &reqwest::Client,
-    base_url: &str,
-    model: &str,
-    prompt: &str,
-    concurrency: usize,
-    max_tokens: usize,
-) -> (f64, f64, usize) {
-    let t0 = Instant::now();
-    let mut handles = Vec::with_capacity(concurrency);
-
-    for _ in 0..concurrency {
-        let cl = client.clone();
-        let url = base_url.to_string();
-        let mdl = model.to_string();
-        let pr = prompt.to_string();
-        handles.push(tokio::spawn(async move {
-            measure_streaming(&cl, &url, &mdl, &pr, max_tokens).await
-        }));
-    }
-
-    let mut total_tokens = 0;
-    let mut sum_ttft = 0.0;
-    for h in handles {
-        if let Ok(res) = h.await {
-            total_tokens += res.total_tokens;
-            sum_ttft += res.ttft_ms;
-        }
-    }
-
-    let elapsed_s = t0.elapsed().as_secs_f64();
-    let agg_tok_per_sec = if elapsed_s > 0.0 {
-        total_tokens as f64 / elapsed_s
-    } else {
-        0.0
-    };
-    let avg_ttft = sum_ttft / concurrency as f64;
-
-    (agg_tok_per_sec, avg_ttft, total_tokens)
+    let tokens = parser.finish()?;
+    let elapsed = started.elapsed();
+    let ttft = first.ok_or("No generated-token event in completed stream")?;
+    let decode_duration = last.unwrap().saturating_sub(ttft).as_secs_f64();
+    Ok(StreamResult {
+        tokens,
+        ttft_ms: ttft.as_secs_f64() * 1000.,
+        latency_ms: elapsed.as_secs_f64() * 1000.,
+        end_to_end_tokens_per_sec: tokens as f64 / elapsed.as_secs_f64(),
+        observed_decode_tokens_per_sec: if tokens > 1 && decode_duration > 0. {
+            Some((tokens - 1) as f64 / decode_duration)
+        } else {
+            None
+        },
+        authoritative_usage: parser.completion_tokens.is_some(),
+    })
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    if args.rounds == 0 || args.concurrency == 0 || args.max_tokens == 0 {
+        return Err("rounds, concurrency, and max-tokens must be positive".into());
+    }
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(key) = args.api_key {
+        let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}"))
+            .map_err(|_| "Invalid API credential header")?;
+        value.set_sensitive(true);
+        headers.insert(reqwest::header::AUTHORIZATION, value);
+    }
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .expect("Failed to build client");
-
-    println!("========================================================");
-    println!("PURE RUST BENCHMARK HARNESS (RLSE)");
-    println!("Target URL : {}", args.url);
-    println!("Model ID   : {}", args.model);
-    println!("========================================================");
-
-    // Warmup
-    print!("[*] Warming up server... ");
-    let _ = measure_streaming(&client, &args.url, &args.model, "Hello!", 5).await;
-    println!("done.");
-
-    // 1. Short prompt
-    println!("\n[1] Short Prompt (~10 tokens prefill, 25 tokens max decode):");
-    let ttft_short = measure_pure_ttft(&client, &args.url, &args.model, PROMPT_SHORT).await;
-    let res_short = measure_streaming(&client, &args.url, &args.model, PROMPT_SHORT, 25).await;
-    println!("    - Pure Prefill TTFT : {:.2} ms", ttft_short);
-    println!(
-        "    - End-to-End Latency: {:.2} ms",
-        res_short.total_latency_ms
-    );
-    println!(
-        "    - Decode Speed      : {:.1} tok/s",
-        res_short.tok_per_sec
-    );
-    println!("    - Tokens Produced   : {}", res_short.total_tokens);
-    let sample: String = res_short.sample_text.chars().take(60).collect();
-    println!("    - Sample Output     : \"{}...\"", sample.trim());
-
-    // 2. Medium prompt
-    println!("\n[2] Medium Prompt (~200 tokens prefill, 50 tokens max decode):");
-    let ttft_med = measure_pure_ttft(&client, &args.url, &args.model, PROMPT_MEDIUM).await;
-    let res_med = measure_streaming(&client, &args.url, &args.model, PROMPT_MEDIUM, 50).await;
-    println!("    - Pure Prefill TTFT : {:.2} ms", ttft_med);
-    println!(
-        "    - End-to-End Latency: {:.2} ms",
-        res_med.total_latency_ms
-    );
-    println!("    - Decode Speed      : {:.1} tok/s", res_med.tok_per_sec);
-    println!("    - Tokens Produced   : {}", res_med.total_tokens);
-
-    // 3. Long prompt
-    println!("\n[3] Long Prompt (~450 tokens prefill, 50 tokens max decode):");
-    let ttft_long = measure_pure_ttft(&client, &args.url, &args.model, PROMPT_LONG).await;
-    let res_long = measure_streaming(&client, &args.url, &args.model, PROMPT_LONG, 50).await;
-    println!("    - Pure Prefill TTFT : {:.2} ms", ttft_long);
-    println!(
-        "    - End-to-End Latency: {:.2} ms",
-        res_long.total_latency_ms
-    );
-    println!(
-        "    - Decode Speed      : {:.1} tok/s",
-        res_long.tok_per_sec
-    );
-    println!("    - Tokens Produced   : {}", res_long.total_tokens);
-
-    // 4. Concurrent Continuous Batching
-    println!("\n[4] Concurrent Continuous Batching (C=4 streams, 30 tokens each):");
-    let (c4_tok_s, c4_avg_ttft, c4_tokens) =
-        measure_concurrency(&client, &args.url, &args.model, PROMPT_SHORT, 4, 30).await;
-    println!("    - Aggregated Throughput: {:.1} tok/s", c4_tok_s);
-    println!("    - Average TTFT         : {:.2} ms", c4_avg_ttft);
-    println!("    - Total Tokens         : {}", c4_tokens);
-
-    println!("\n========================================================");
-    println!("BENCHMARK RUN COMPLETED");
-    println!("========================================================");
+        .default_headers(headers)
+        .timeout(Duration::from_secs(120))
+        .build()?;
+    println!("model={} prefix_mode={:?} warmups={} rounds={} concurrency={} max_tokens={} temperature=0 top_p=1",args.model,args.prefix_mode,args.warmups,args.rounds,args.concurrency,args.max_tokens);
+    println!("Timings are client observations including network, queueing, and prefill; decode rate uses arrivals after the first token. Cold mode adds a unique leading nonce per request to prevent prefix reuse.");
+    for _ in 0..args.warmups {
+        measure(
+            &client,
+            &args.url,
+            &args.model,
+            &args.prompt,
+            args.max_tokens,
+        )
+        .await?;
+    }
+    for round in 0..args.rounds {
+        let before: serde_json::Value = client
+            .get(format!("{}/api/status", args.url))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let started = Instant::now();
+        let results = futures_util::future::join_all((0..args.concurrency).map(|_| {
+            let prompt = match args.prefix_mode {
+                PrefixMode::Warm => args.prompt.clone(),
+                PrefixMode::Cold => format!("{}\n{}", uuid::Uuid::new_v4(), args.prompt),
+            };
+            let client = &client;
+            let url = &args.url;
+            let model = &args.model;
+            async move { measure(client, url, model, &prompt, args.max_tokens).await }
+        }))
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+        let elapsed = started.elapsed().as_secs_f64();
+        let total: usize = results.iter().map(|r| r.tokens).sum();
+        let after: serde_json::Value = client
+            .get(format!("{}/api/status", args.url))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let delta = |name: &str| -> Result<u64, String> {
+            let a = after["prefix_cache"][name]
+                .as_u64()
+                .ok_or("Missing prefix metric")?;
+            let b = before["prefix_cache"][name]
+                .as_u64()
+                .ok_or("Missing prefix metric")?;
+            a.checked_sub(b)
+                .ok_or_else(|| "Server counters reset during measurement".into())
+        };
+        println!(
+            "  server_prefix_hits={} server_prefix_misses={} server_prefix_tokens_saved={}",
+            delta("hits")?,
+            delta("misses")?,
+            delta("tokens_saved")?
+        );
+        println!(
+            "round={} aggregate_end_to_end_tokens_per_sec={:.2} tokens={} elapsed_ms={:.2}",
+            round + 1,
+            total as f64 / elapsed,
+            total,
+            elapsed * 1000.
+        );
+        for (i, result) in results.iter().enumerate() {
+            println!("  request={} tokens={} count_source={} ttft_ms={:.2} latency_ms={:.2} end_to_end_tokens_per_sec={:.2} observed_decode_tokens_per_sec={}",i+1,result.tokens,if result.authoritative_usage {"server_usage"}else{"token_events_estimate"},result.ttft_ms,result.latency_ms,result.end_to_end_tokens_per_sec,result.observed_decode_tokens_per_sec.map_or_else(||"unmeasurable".into(),|n|format!("{n:.2}")));
+        }
+    }
+    Ok(())
 }

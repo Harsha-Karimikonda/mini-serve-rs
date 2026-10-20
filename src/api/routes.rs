@@ -32,16 +32,22 @@ pub struct AppState {
 }
 
 pub fn create_app(state: AppState) -> Router {
-    Router::new()
-        .route("/", get(dashboard_handler))
-        .route("/dashboard", get(dashboard_handler))
-        .route("/health", get(health_handler))
-        .route("/ready", get(readiness_handler))
+    let protected = Router::new()
         .route("/v1/models", get(models_handler))
         .route("/v1/completions", post(completions_handler))
         .route("/v1/chat/completions", post(chat_completions_handler))
         .route("/api/status", get(status_handler))
         .route("/metrics", get(metrics_handler))
+        .route_layer(axum::middleware::from_fn_with_state(
+            crate::api::auth::ApiAuth::new(&state.settings),
+            crate::api::auth::authenticate,
+        ));
+    Router::new()
+        .merge(protected)
+        .route("/", get(dashboard_handler))
+        .route("/dashboard", get(dashboard_handler))
+        .route("/health", get(health_handler))
+        .route("/ready", get(readiness_handler))
         .with_state(state)
 }
 
@@ -87,8 +93,12 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-async fn dashboard_handler() -> Html<&'static str> {
-    Html(DASHBOARD_HTML)
+async fn dashboard_handler(State(state): State<AppState>) -> Html<&'static str> {
+    if state.settings.api_key.is_some() || !state.settings.api_keys.is_empty() {
+        Html("<!doctype html><title>RLSE</title><p>API authentication is enabled. Use an API client with an Authorization bearer header. The browser dashboard is disabled.</p>")
+    } else {
+        Html(DASHBOARD_HTML)
+    }
 }
 
 async fn health_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -133,6 +143,7 @@ async fn models_handler(State(state): State<AppState>) -> Json<ModelListResponse
 
 async fn completions_handler(
     State(state): State<AppState>,
+    permit: Option<axum::Extension<std::sync::Arc<crate::core::client_limits::ClientPermit>>>,
     Json(req): Json<CompletionRequest>,
 ) -> Result<Response, EngineError> {
     let t0 = Instant::now();
@@ -154,18 +165,24 @@ async fn completions_handler(
 
     let rx = state
         .router
-        .submit_model(&req.model, request_id.clone(), req.prompt, sampling)
+        .submit_model_with_permit(
+            &req.model,
+            request_id.clone(),
+            req.prompt,
+            sampling,
+            permit.map(|p| p.0),
+        )
         .await?;
 
     if req.stream {
         let stream_req_id = request_id.0.clone();
         let stream_model = req.model.clone();
-        let telemetry = state.telemetry.clone();
 
         let sse_stream = response_events(rx).flat_map(move |event| match event {
             TokenEvent::Token(token_text) => {
                 let chunk = CompletionChunk {
                     id: stream_req_id.clone(),
+                    usage: None,
                     object: "text_completion.chunk".to_string(),
                     created: now_secs(),
                     model: stream_model.clone(),
@@ -183,9 +200,9 @@ async fn completions_handler(
                 finish_reason,
                 usage,
             } => {
-                telemetry.record_tokens(usage.completion_tokens);
                 let final_chunk = CompletionChunk {
                     id: stream_req_id.clone(),
+                    usage: Some(usage),
                     object: "text_completion.chunk".to_string(),
                     created: now_secs(),
                     model: stream_model.clone(),
@@ -221,7 +238,6 @@ async fn completions_handler(
             .into_response())
     } else {
         let (full_text, final_usage, final_finish_reason) = collect_response(rx).await?;
-        state.telemetry.record_tokens(final_usage.completion_tokens);
 
         let response = CompletionResponse {
             id: request_id.0,
@@ -251,6 +267,7 @@ async fn completions_handler(
 
 async fn chat_completions_handler(
     State(state): State<AppState>,
+    permit: Option<axum::Extension<std::sync::Arc<crate::core::client_limits::ClientPermit>>>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, EngineError> {
     let t0 = Instant::now();
@@ -272,18 +289,24 @@ async fn chat_completions_handler(
 
     let rx = state
         .router
-        .submit_chat(&req.model, request_id.clone(), &req.messages, sampling)
+        .submit_chat_with_permit(
+            &req.model,
+            request_id.clone(),
+            &req.messages,
+            sampling,
+            permit.map(|p| p.0),
+        )
         .await?;
 
     if req.stream {
         let stream_req_id = request_id.0.clone();
         let stream_model = req.model.clone();
-        let telemetry = state.telemetry.clone();
 
         let sse_stream = response_events(rx).flat_map(move |event| match event {
             TokenEvent::Token(token_text) => {
                 let chunk = ChatCompletionChunk {
                     id: stream_req_id.clone(),
+                    usage: None,
                     object: "chat.completion.chunk".to_string(),
                     created: now_secs(),
                     model: stream_model.clone(),
@@ -304,9 +327,9 @@ async fn chat_completions_handler(
                 finish_reason,
                 usage,
             } => {
-                telemetry.record_tokens(usage.completion_tokens);
                 let final_chunk = ChatCompletionChunk {
                     id: stream_req_id.clone(),
+                    usage: Some(usage),
                     object: "chat.completion.chunk".to_string(),
                     created: now_secs(),
                     model: stream_model.clone(),
@@ -345,7 +368,6 @@ async fn chat_completions_handler(
             .into_response())
     } else {
         let (full_text, final_usage, final_finish_reason) = collect_response(rx).await?;
-        state.telemetry.record_tokens(final_usage.completion_tokens);
 
         let response = ChatCompletionResponse {
             id: request_id.0,
@@ -394,6 +416,7 @@ async fn status_handler(State(state): State<AppState>) -> Json<serde_json::Value
                 "queue_depth": m.queue_depth,
                 "active_count": m.active_count,
                 "avg_latency_ms": m.avg_latency_ms,
+                "execution": m.execution,
                 "score": (w.score() * 10.0).round() / 10.0
             })
         })
@@ -405,8 +428,9 @@ async fn status_handler(State(state): State<AppState>) -> Json<serde_json::Value
         "version": "0.2.0",
         "model": state.router.model_names().first(),
         "models": state.router.model_names(),
-        "tokens_per_sec": state.telemetry.tokens_per_second(),
-        "total_tokens": state.telemetry.total_tokens(),
+        "tokens_per_sec": state.router.tokens_per_second(),
+        "total_tokens": state.router.execution_stats().generated_tokens,
+        "execution": state.router.execution_stats(),
         "total_requests": state.telemetry.total_requests(),
         "workers": workers_info,
         "cache": {
@@ -428,8 +452,9 @@ async fn status_handler(State(state): State<AppState>) -> Json<serde_json::Value
 }
 
 async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let tps = state.telemetry.tokens_per_second();
-    let total_tokens = state.telemetry.total_tokens();
+    let tps = state.router.tokens_per_second();
+    let execution = state.router.execution_stats();
+    let total_tokens = execution.generated_tokens;
     let total_requests = state.telemetry.total_requests();
     let cache = state.cache.lock().stats();
 
@@ -444,6 +469,18 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
             .filter(|w| w.scheduler.is_healthy())
             .count()
     ));
+    for (name, value) in [
+        ("accepted_total", execution.accepted),
+        ("completed_total", execution.completed),
+        ("errors_total", execution.errors),
+        ("cancellations_total", execution.cancellations),
+        ("queue_delay_count", execution.queue_delay_count),
+        ("queue_delay_microseconds_total", execution.queue_delay_us),
+        ("ttft_count", execution.ttft_count),
+        ("ttft_microseconds_total", execution.ttft_us),
+    ] {
+        body.push_str(&format!("# HELP mini_execution_{name} Scheduler execution accounting\n# TYPE mini_execution_{name} counter\nmini_execution_{name} {value}\n"));
+    }
     body.push_str("# HELP mini_tokens_per_second Current token generation throughput\n");
     body.push_str("# TYPE mini_tokens_per_second gauge\n");
     body.push_str(&format!("mini_tokens_per_second {}\n\n", tps));

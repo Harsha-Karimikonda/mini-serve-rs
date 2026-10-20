@@ -96,12 +96,16 @@ Cancellation is checked between forward steps. Its latency depends on the durati
 
 ## 5. Implementation Status & Active Roadmap
 
-**2026-10-20 update:** Chat templates and actual model identity are implemented
-with independent pinned Qwen CPU references. GPU verification of this milestone
-remains pending, so its delivery checkbox stays open. See [current changes,
-commands, and blockers](chat_correctness.md). Earlier dated findings below are
-historical; the ignored chat-format test is now enabled.
-
+**2026-10-20 update:** API-key authentication is implemented and verified on
+CPU and actual Apple M4 Metal inference with pinned Qwen3-0.6B weights.
+Chat formatting/model identity also pass their focused Metal gate. Dedicated
+worker draining, cleanup, and HTTP responsiveness pass on Metal; process-signal
+integration remains open. Default/Metal-feature suites each pass 62 tests.
+See [authentication](api_authentication.md), [worker lifecycle](worker_lifecycle.md),
+[chat correctness](chat_correctness.md), and [current GPU evidence](gpu_validation.md#verified-current-working-tree-2026-10-20).
+Per-client rate/concurrency limits are the next unimplemented serving priority.
+Earlier dated evidence below retains its historical scope; no validating commit
+or hosted CI result is recorded.
 
 See the [production blocker investigation record](production_reproductions.md) for historical 2026-10-16 measurements and retained regression checks; the manual latency and contention probes have since been removed. Those checks reproduced HTTP-runtime blocking, generic chat formatting, and backend lock contention; the tested working tree passed the focused stop-handling and tensor-reservation checks. These results do not establish driver-level memory safety or multi-thread production-server latency.
 
@@ -131,12 +135,12 @@ These ratings describe demonstrated coverage and remaining limitations, not prod
 
 | Area | Maturity | Assessment |
 | :--- | :--- | :--- |
-| **Control plane & continuous batching** | **Medium–High** | Admission, cancellation, worker-state isolation, and reserved terminal delivery have regression coverage. Quarantined-backend routing is implemented. Worker supervision and bounded shutdown remain open. Channel saturation terminates the slow request explicitly; it does not pause batch progress. |
-| **API protocol & streaming** | **Medium** | JSON/SSE completion and explicit termination/error behavior are tested. Model identity and artifact-defined chat templates have CPU coverage as of 2026-10-20; their GPU verification remains pending. |
-| **Inference & device kernels** | **Medium** | CPU fixtures cover grouped-query attention, batched decode, prefix restoration, and interleaved workers. Pretrained Metal cached/uncached greedy output and two-worker comparisons now pass the focused GPU gate. The shared backend mutex still serializes workers, and synchronous inference runs inside async tasks. Numeric GPU logit comparisons and broader device/load coverage remain open. |
+| **Control plane & continuous batching** | **Medium–High** | Admission, cancellation, worker-state isolation, and reserved terminal delivery have regression coverage. Quarantined-backend routing is implemented. Worker supervision and bounded draining are implemented with CPU and focused Metal checks; process-signal/deadline integration remains open. Channel saturation terminates the slow request explicitly; it does not pause batch progress. |
+| **API protocol & streaming** | **Medium** | JSON/SSE completion and explicit termination/error behavior are tested. Model identity and artifact-defined chat templates have CPU/reference and focused pretrained Metal coverage as of 2026-10-20. |
+| **Inference & device kernels** | **Medium** | CPU fixtures cover grouped-query attention, batched decode, prefix restoration, and interleaved workers. Pretrained Metal cached/uncached greedy output and two-worker comparisons now pass the focused GPU gate. The shared backend mutex still serializes workers; dedicated inference threads now isolate synchronous forwards from the HTTP runtime. Numeric GPU logit comparisons and broader device/load coverage remain open. |
 | **Memory & KV cache management** | **Low for production memory control** | Logical block accounting coexists with real contiguous KV tensors and cached prefix activations. Physical paging is absent. Tensor-memory reservations, prefix eviction, cancellation release, and admission rejection are verified by CPU regressions and focused pretrained Metal inference. Device allocator measurements, forced OOM/recovery, and production load bounds remain open. |
-| **Text generation & output quality** | **Low–Medium** | Prefix reuse and stop matching across tokens have CPU and focused pretrained Metal checks. Artifact-defined chat formatting has CPU/reference coverage; pretrained GPU chat verification remains pending. Pretrained output quality requires broader evaluation beyond these targeted checks. |
-| **Production operations & security** | **Low** | CI and pre-commit checks exist; hosted CI execution is not yet recorded. API-key authentication, per-client quotas, worker supervision, and bounded draining remain open. Existing queue limits provide overload protection, not per-client rate limiting. |
+| **Text generation & output quality** | **Low–Medium** | Prefix reuse and stop matching across tokens have CPU and focused pretrained Metal checks. Artifact-defined chat formatting has CPU/reference and focused pretrained Metal coverage. Pretrained output quality requires broader evaluation beyond these targeted checks. |
+| **Production operations & security** | **Low** | CI and pre-commit checks exist; hosted CI execution is not yet recorded. API-key authentication, worker supervision, and bounded draining are implemented; per-client quotas and process-signal integration remain open. Existing queue limits provide overload protection, not per-client rate limiting. |
 
 Returned Candle execution errors now quarantine the shared backend and trigger explicit request cleanup; see the [failure policy](device_failures.md). Reservation pressure is recoverable. This does not establish proactive GPU-memory protection or in-process device recovery after OOM.
 
@@ -224,17 +228,37 @@ gate now recorded in [AGENTS.md](../AGENTS.md).
 
   **Implementation evidence (2026-10-16, working tree):** A scheduler-owned incremental matcher filters output for Mock and Candle before either HTTP response mode sees it. It retains only suffixes that could complete a stop, strips the first completed match and all following text, handles overlapping and Unicode stops, and flushes unmatched suffixes on EOS or token limits. Candle suppresses `<|im_end|>` and `<|endoftext|>` text in prefill and decode; backend-local substring matching is removed. Raw decoded history remains separate from visible output so withheld text does not corrupt incremental decoding. Usage counts generated token IDs, including empty decodes and EOS; successful streaming telemetry now records authoritative terminal usage. HTTP tests cover both endpoints and modes; CPU Candle fixtures cover EOS suppression and the two stop reproductions now run as regression tests. The same default/Metal checks above passed with these regressions enabled. Pretrained Metal stop behavior is now verified by the focused GPU check above; broad output-quality and CUDA validation remain open.
 
-- [ ] **Use model-specific chat formatting and truthful model identity.** Replace generic `role: content` concatenation with the supported model's chat template. Validate roles and requested model names. List only available models, avoid duplicate `mock` entries, report the actual serving model, and update the dashboard's hardcoded model selection.
+- [x] **Use model-specific chat formatting and truthful model identity.** Replace generic `role: content` concatenation with the supported model's chat template. Validate roles and requested model names. List only available models, avoid duplicate `mock` entries, report the actual serving model, and update the dashboard's hardcoded model selection.
 
   **Acceptance:** Assert formatted prompt token IDs for supported Qwen chat templates. Unsupported model names fail clearly. Model listing, responses, dashboard requests, and explicitly enabled mock fallback agree about which backend is serving.
 
-- [ ] **Separate inference execution from HTTP scheduling and supervise workers.** Candle currently performs synchronous computation under a shared mutex inside an async task. Use a dedicated inference execution path with bounded communication and explicit cancellation. Retain worker handles, stop admission during shutdown, support bounded draining, and surface worker failures to routing and readiness checks.
+  **Verification update (2026-10-20):** Pinned Qwen template/token references,
+  actual loaded identity, and JSON/SSE chat agree with direct greedy pretrained
+  Metal inference. See [current GPU evidence](gpu_validation.md#verified-current-working-tree-2026-10-20).
+  This does not establish broad pretrained generation quality or CUDA correctness.
+
+- [ ] **Separate inference execution from HTTP scheduling and supervise workers.** The historical implementation performed synchronous computation under a shared mutex inside an HTTP-runtime async task. Use a dedicated inference execution path with bounded communication and explicit cancellation. Retain worker handles, stop admission during shutdown, support bounded draining, and surface worker failures to routing and readiness checks.
 
   **Acceptance:** A delayed forward pass does not prevent health/status requests from being serviced within a defined test bound. Worker failure removes that worker from routing; a saturated worker does not cause rejection when another eligible worker has capacity. Shutdown completes within its configured deadline and leaves no active allocations or worker tasks.
 
-- [ ] **Authenticate protected API routes.** Add configurable API-key verification for inference and other explicitly protected routes, and document any public liveness endpoint. Keep credentials out of request logs, error payloads, and the dashboard. Define how local development and authenticated deployments are configured.
+  **Implementation evidence (2026-10-20):** The batching loop now runs on a dedicated thread/runtime. Supervisor handles join workers; forward panics fail active/queued streams and remove routing eligibility. Admission retries available workers after queue saturation. Ctrl-C stops admission, drains until the configured deadline, then enforces a process exit bound. Four CPU regressions cover blocking-forward HTTP responsiveness, panic cleanup, queue routing, and draining. Default/Metal suites and Clippy pass; the explicit pretrained Metal gate fails its missing-weights prerequisite. Focused GPU lifecycle verification subsequently passed; process-signal integration remains pending. See [commands, results, and limitations](worker_lifecycle.md).
+
+- [x] **Authenticate protected API routes.** Add configurable API-key verification for inference and other explicitly protected routes, and document any public liveness endpoint. Keep credentials out of request logs, error payloads, and the dashboard. Define how local development and authenticated deployments are configured.
 
   **Acceptance:** Missing or invalid credentials are rejected before tokenization, queue admission, or tensor reservation. Valid credentials work for JSON and SSE. Tests cover protected routes and explicitly public endpoints, and logs do not expose credentials.
+
+  **Implementation evidence (2026-10-20):** `RLSE_API_KEY` / `--api-key`
+  enables bearer authentication before request parsing/tokenization/admission.
+  Inference, model listing, status, and metrics require credentials; health and
+  readiness remain public. The authenticated dashboard displays a static notice
+  without handling secrets. CPU tests cover invalid/missing/duplicate headers,
+  protected/public routes, pre-admission rejection, redacted errors/settings,
+  and successful JSON/SSE. The explicit Qwen3-0.6B Metal gate verifies both
+  authenticated generation routes/modes against direct greedy output and
+  checks cleanup. Default/Metal suites each pass 62 tests; formatting and both
+  Clippy configurations pass. See [configuration and limitations](api_authentication.md)
+  and [GPU artifacts/commands/results](gpu_validation.md#verified-current-working-tree-2026-10-20).
+  This is one shared key; per-client identity and quotas remain below.
 
 - [ ] **Add per-client request and concurrency limits.** Keep existing queue/capacity rejection as global overload protection. Add bounded request-rate and concurrent-generation quotas per authenticated client, with a documented identity policy when authentication is disabled. Release concurrency permits on completion, error, cancellation, and shutdown.
 

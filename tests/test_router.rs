@@ -26,8 +26,7 @@ async fn test_latency_aware_routing_balances_traffic() {
         backend.clone(),
     ));
 
-    sched_1.start_loop();
-    sched_2.start_loop();
+    // Keep queues stationary while asserting routing scores.
 
     let router = Router::new(vec![
         WorkerHandle::new("worker-1", sched_1.clone()),

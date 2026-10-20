@@ -26,9 +26,9 @@ fn test_prefix_cache_insert_and_lookup() {
     assert_eq!(hit_lookup.chunk_hashes.len(), 3);
 
     let (hits, misses, tokens_saved) = cache.stats();
-    assert_eq!(hits, 1);
-    assert_eq!(misses, 1);
-    assert_eq!(tokens_saved, 48);
+    assert_eq!(hits, 0);
+    assert_eq!(misses, 0);
+    assert_eq!(tokens_saved, 0); // Metadata matches do not skip prefill.
 }
 
 #[test]

@@ -2,6 +2,13 @@
 
 Mini-Serve exposes a fully OpenAI-compatible REST API alongside Prometheus metrics, health checks, and a live web dashboard.
 
+When `RLSE_API_KEY` is configured, send `Authorization: Bearer <key>` for
+`/v1/*`, `/api/status`, and `/metrics`. Invalid/missing credentials return 401
+before generation. `/health` and `/ready` remain public; the interactive
+dashboard is disabled in authenticated deployments. Without a configured key,
+local development remains unauthenticated. See [authentication configuration,
+route policy, and verification](api_authentication.md).
+
 ---
 
 ## 1. OpenAI-Compatible Endpoints

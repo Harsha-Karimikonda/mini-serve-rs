@@ -145,7 +145,7 @@ async fn assert_responses(
             }
             assert_eq!(text, expected, "chat={chat}, streaming={streaming}");
             assert_eq!(finish_reason, reason);
-            assert_eq!(telemetry.total_tokens(), generated);
+            assert_eq!(scheduler.metrics().execution.generated_tokens, generated);
             scheduler.shutdown();
             handle.await.unwrap();
             assert_eq!(cache.lock().allocated_count(), 0);

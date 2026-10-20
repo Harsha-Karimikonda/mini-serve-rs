@@ -661,3 +661,87 @@ async fn unavailable_chat_template_leaves_completions_usable() {
     scheduler.shutdown();
     handle.await.unwrap();
 }
+
+#[tokio::test]
+async fn api_authentication_precedes_parsing_and_generation() {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let secret = "test-secret-do-not-echo";
+        let backend = Arc::new(CapturePrompt(parking_lot::Mutex::new(None)));
+        let cache = create_shared_cache(256, 16);
+        let prefix = create_shared_prefix_cache(16, 128);
+        let telemetry = create_telemetry();
+        let scheduler = Arc::new(Scheduler::new(4, 32, cache.clone(), prefix.clone(), backend.clone()));
+        let settings = Settings { api_key: Some(secret.into()), hf_token: Some("private-hf-token".into()), ..Settings::default() };
+        assert!(!format!("{settings:?}").contains(secret));
+        assert!(!format!("{settings:?}").contains("private-hf-token"));
+        let app = create_app(AppState {
+            router: Arc::new(Router::new(vec![WorkerHandle::new("auth", scheduler.clone())])),
+            cache: cache.clone(), prefix_cache: prefix.clone(), telemetry: telemetry.clone(), settings,
+        });
+        for path in ["/v1/models", "/v1/completions", "/v1/chat/completions", "/api/status", "/metrics"] {
+            for authorization in [None, Some("Bearer wrong-secret"), Some("Basic test-secret-do-not-echo"), Some("Bearer "), Some("Bearer  test-secret-do-not-echo"), Some("Bearer test-secret-do-not-echo ")] {
+                let mut request = Request::builder().uri(path).method(if path.ends_with("completions") { "POST" } else { "GET" });
+                if let Some(value) = authorization { request = request.header("authorization", value); }
+                let response = app.clone().oneshot(request.body(Body::from("invalid JSON")).unwrap()).await.unwrap();
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+                assert_eq!(response.headers()["www-authenticate"], "Bearer");
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                let body = std::str::from_utf8(&body).unwrap();
+                assert!(!body.contains(secret) && !body.contains("wrong-secret"));
+            }
+        }
+        let response = app.clone().oneshot(Request::builder().uri("/v1/models")
+            .header("authorization", format!("Bearer {secret}"))
+            .header("authorization", "Bearer wrong-secret").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(backend.0.lock().is_none());
+        assert_eq!(scheduler.queue_depth(), 0);
+        assert_eq!(cache.lock().allocated_count(), 0);
+        assert_eq!(prefix.lock().memory_budget().stats().active_kv_reserved_bytes, 0);
+        assert_eq!(telemetry.total_requests(), 0);
+        for path in ["/health", "/ready", "/", "/dashboard"] {
+            let response = app.clone().oneshot(Request::builder().uri(path).body(Body::empty()).unwrap()).await.unwrap();
+            assert!(response.status().is_success());
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(!std::str::from_utf8(&body).unwrap().contains(secret));
+            if path == "/dashboard" { assert!(std::str::from_utf8(&body).unwrap().contains("dashboard is disabled")); }
+        }
+        let task = scheduler.start_loop();
+        for path in ["/v1/models", "/api/status", "/metrics", "/v1/completions", "/v1/chat/completions"] {
+            for stream in [false, true] {
+                let response = app.clone().oneshot(Request::builder().uri(path)
+                    .method(if path.ends_with("completions") { "POST" } else { "GET" })
+                    .header("authorization", format!("bEaReR {secret}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::json!({"model":"capture", "prompt":"hello", "messages":[{"role":"user","content":"hello"}],"max_tokens":1,"stream":stream}).to_string())).unwrap()).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{path}");
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                if path.ends_with("completions") && stream { assert!(std::str::from_utf8(&body).unwrap().ends_with("data: [DONE]\n\n")); }
+            }
+        }
+        scheduler.shutdown();
+        task.await.unwrap();
+        assert_eq!(cache.lock().allocated_count(), 0);
+    }).await.expect("authenticated requests must finish");
+}
+
+#[test]
+fn api_key_configuration_rejects_unusable_secrets_without_echoing() {
+    for key in ["", " ", "has space", "has\nnewline", "nonascii-é"] {
+        let settings = Settings {
+            api_key: Some(key.into()),
+            ..Settings::default()
+        };
+        let error = settings.validate().unwrap_err().to_string();
+        assert!(error.contains("api_key"));
+        if key.len() > 1 {
+            assert!(!error.contains(key));
+        }
+    }
+    Settings {
+        api_key: Some("usable-secret".into()),
+        ..Settings::default()
+    }
+    .validate()
+    .unwrap();
+}

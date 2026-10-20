@@ -157,6 +157,8 @@ pub struct CompletionChunk {
     pub created: u64,
     pub model: String,
     pub choices: Vec<CompletionChunkChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,6 +200,8 @@ pub struct ChatCompletionChunk {
     pub created: u64,
     pub model: String,
     pub choices: Vec<ChatChunkChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -245,6 +249,8 @@ pub struct ActiveSequence {
     /// Capacity reserved at admission so a terminal event cannot be dropped.
     pub terminal_permit: Option<tokio::sync::mpsc::OwnedPermit<TokenEvent>>,
     pub terminal_error: Option<String>,
+    pub trace: Option<crate::telemetry::metrics::RequestTrace>,
+    pub client_permit: Option<std::sync::Arc<crate::core::client_limits::ClientPermit>>,
 }
 
 impl ActiveSequence {
@@ -273,10 +279,27 @@ impl ActiveSequence {
             tx,
             terminal_permit: None,
             terminal_error: None,
+            client_permit: None,
+            trace: None,
         }
     }
 
     pub fn send_terminal(&mut self, event: TokenEvent) {
+        if let Some(trace) = &mut self.trace {
+            use crate::telemetry::metrics::Outcome;
+            trace.finish(if self.tx.is_closed() {
+                Outcome::Cancelled
+            } else {
+                match &event {
+                    TokenEvent::Done { finish_reason, .. } if finish_reason == "abort" => {
+                        Outcome::Cancelled
+                    }
+                    TokenEvent::Done { .. } => Outcome::Completed,
+                    TokenEvent::Error(_) => Outcome::Error,
+                    TokenEvent::Token(_) => return,
+                }
+            });
+        }
         if let Some(permit) = self.terminal_permit.take() {
             permit.send(event);
         } else {
