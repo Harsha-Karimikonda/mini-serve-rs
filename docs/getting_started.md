@@ -59,7 +59,7 @@ To serve a real model (such as `Qwen/Qwen2.5-0.5B-Instruct` or `Qwen/Qwen3-0.6B`
   --port 8000 \
   --num-workers 2
 ```
-If the model weights are not found locally in `models/`, Mini-Serve will automatically download the `config.json`, `tokenizer.json`, and `model.safetensors` files from Hugging Face Hub into `~/.cache/huggingface/hub/` and memory-map them directly into unified RAM.
+If the model weights are not found locally in `models/`, Mini-Serve will automatically download the `config.json`, `tokenizer.json`, `tokenizer_config.json` (for chat), and `model.safetensors` files from Hugging Face Hub into `~/.cache/huggingface/hub/` and memory-map them directly into unified RAM.
 
 ### C. Offline / Local Directory Serving
 If you already have models downloaded on disk:

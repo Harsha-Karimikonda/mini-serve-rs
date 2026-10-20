@@ -25,6 +25,12 @@ impl ModelBackend for Script {
     fn name(&self) -> &str {
         "mock"
     }
+    fn format_chat(
+        &self,
+        messages: &[rlse::core::types::ChatMessage],
+    ) -> Result<String, EngineError> {
+        MockBackend::new("mock", 0).format_chat(messages)
+    }
     async fn init_sequence(&self, _: &str) -> Result<Vec<u32>, EngineError> {
         Ok(vec![1])
     }

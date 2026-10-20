@@ -17,7 +17,11 @@ use rlse::scheduler::scheduler::Scheduler;
 use rlse::telemetry::create_telemetry;
 
 fn setup_test_app() -> axum::Router {
-    let settings = Settings::default();
+    // Simulate explicit fallback: configured identity differs from the loaded mock.
+    let settings = Settings {
+        model: "unloaded-model".into(),
+        ..Settings::default()
+    };
     let cache = create_shared_cache(256, 16);
     let prefix_cache = create_shared_prefix_cache(16, 128);
     let telemetry = create_telemetry();
@@ -77,6 +81,8 @@ async fn test_health_and_models_endpoints() {
     let body = res.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["object"], "list");
+    assert_eq!(json["data"].as_array().unwrap().len(), 1);
+    assert_eq!(json["data"][0]["id"], "mock");
 }
 
 #[tokio::test]
@@ -201,7 +207,13 @@ struct FailingBackend;
 #[async_trait::async_trait]
 impl rlse::backends::ModelBackend for FailingBackend {
     fn name(&self) -> &str {
-        "failing"
+        "mock"
+    }
+    fn format_chat(
+        &self,
+        messages: &[rlse::core::types::ChatMessage],
+    ) -> Result<String, EngineError> {
+        MockBackend::new("mock", 0).format_chat(messages)
     }
     async fn init_sequence(&self, _: &str) -> Result<Vec<u32>, rlse::core::errors::EngineError> {
         Ok(vec![1])
@@ -390,6 +402,16 @@ impl ModelBackend for CapturePrompt {
     fn name(&self) -> &str {
         "capture"
     }
+    fn format_chat(
+        &self,
+        messages: &[rlse::core::types::ChatMessage],
+    ) -> Result<String, EngineError> {
+        rlse::backends::chat::ChatTemplate::from_config(include_str!(
+            "fixtures/chat/qwen3-tokenizer_config.json"
+        ))
+        .unwrap()
+        .render(messages)
+    }
     async fn init_sequence(&self, prompt: &str) -> Result<Vec<u32>, EngineError> {
         *self.0.lock() = Some(prompt.into());
         Ok(vec![1])
@@ -410,7 +432,6 @@ impl ModelBackend for CapturePrompt {
 }
 
 #[tokio::test]
-#[ignore = "known gap: route does not apply the Qwen-style chat template"]
 async fn chat_route_applies_role_delimiters() {
     let backend = Arc::new(CapturePrompt(parking_lot::Mutex::new(None)));
     let cache = create_shared_cache(256, 16);
@@ -451,4 +472,192 @@ async fn chat_route_applies_role_delimiters() {
         actual,
         "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n"
     );
+}
+
+#[tokio::test]
+async fn unknown_models_and_roles_are_rejected_before_admission() {
+    let backend = Arc::new(CapturePrompt(parking_lot::Mutex::new(None)));
+    let cache = create_shared_cache(256, 16);
+    let prefix = create_shared_prefix_cache(16, 128);
+    let scheduler = Arc::new(Scheduler::new(
+        4,
+        32,
+        cache.clone(),
+        prefix.clone(),
+        backend.clone(),
+    ));
+    // No loop: valid admissions would queue, invalid requests must not reach it.
+    let app = create_app(AppState {
+        router: Arc::new(Router::new(vec![WorkerHandle::new(
+            "capture",
+            scheduler.clone(),
+        )])),
+        cache: cache.clone(),
+        prefix_cache: prefix,
+        telemetry: create_telemetry(),
+        settings: Settings::default(),
+    });
+    for stream in [false, true] {
+        for (route, model, role, message) in [
+            ("/v1/completions", "missing", "user", "Unknown model"),
+            ("/v1/chat/completions", "missing", "user", "Unknown model"),
+            (
+                "/v1/chat/completions",
+                "capture",
+                "tool",
+                "Unsupported chat role",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(route)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({"model":model,"prompt":"hello",
+                    "messages":[{"role":role,"content":"hello"}],"stream":stream})
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(std::str::from_utf8(&body).unwrap().contains(message));
+            assert!(backend.0.lock().is_none());
+            assert_eq!(scheduler.queue_depth(), 0);
+            assert_eq!(cache.lock().allocated_count(), 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn loaded_identity_is_consistent_after_mock_fallback() {
+    let app = setup_test_app();
+    for route in ["/health", "/api/status"] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(route).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["model"], "mock");
+    }
+    for route in ["/v1/completions", "/v1/chat/completions"] {
+        for stream in [false, true] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(route)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({"model":"mock","prompt":"hello",
+                    "messages":[{"role":"user","content":"hello"}],"max_tokens":1,"stream":stream})
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let text = std::str::from_utf8(&body).unwrap();
+            if stream {
+                for data in text
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter(|data| *data != "[DONE]")
+                {
+                    let value: serde_json::Value = serde_json::from_str(data).unwrap();
+                    assert_eq!(value["model"], "mock");
+                }
+            } else {
+                let value: serde_json::Value = serde_json::from_str(text).unwrap();
+                assert_eq!(value["model"], "mock");
+            }
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(route)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"model":"unloaded-model","prompt":"hello",
+                "messages":[{"role":"user","content":"hello"}]})
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+}
+
+struct CompletionOnly(CapturePrompt);
+#[async_trait::async_trait]
+impl ModelBackend for CompletionOnly {
+    fn name(&self) -> &str {
+        "completion-only"
+    }
+    async fn init_sequence(&self, prompt: &str) -> Result<Vec<u32>, EngineError> {
+        self.0.init_sequence(prompt).await
+    }
+    async fn step_batch(
+        &self,
+        sequences: &mut [ActiveSequence],
+    ) -> Result<Vec<StepToken>, EngineError> {
+        self.0.step_batch(sequences).await
+    }
+}
+
+#[tokio::test]
+async fn unavailable_chat_template_leaves_completions_usable() {
+    let backend = Arc::new(CompletionOnly(CapturePrompt(parking_lot::Mutex::new(None))));
+    let cache = create_shared_cache(256, 16);
+    let prefix = create_shared_prefix_cache(16, 128);
+    let scheduler = Arc::new(Scheduler::new(
+        4,
+        32,
+        cache.clone(),
+        prefix.clone(),
+        backend.clone(),
+    ));
+    let app = create_app(AppState {
+        router: Arc::new(Router::new(vec![WorkerHandle::new(
+            "completion-only",
+            scheduler.clone(),
+        )])),
+        cache,
+        prefix_cache: prefix,
+        telemetry: create_telemetry(),
+        settings: Settings::default(),
+    });
+    for stream in [false, true] {
+        let response = app.clone().oneshot(Request::builder().method("POST").uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::json!({"model":"completion-only", "messages":[{"role":"user","content":"hello"}], "stream":stream}).to_string()))
+            .unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(backend.0 .0.lock().is_none());
+        assert_eq!(scheduler.queue_depth(), 0);
+    }
+    let handle = scheduler.start_loop();
+    let response = app.oneshot(Request::builder().method("POST").uri("/v1/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({"model":"completion-only", "prompt":"unchanged prompt", "max_tokens":1}).to_string()))
+        .unwrap()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.into_body().collect().await.unwrap();
+    assert_eq!(backend.0 .0.lock().as_deref(), Some("unchanged prompt"));
+    scheduler.shutdown();
+    handle.await.unwrap();
 }

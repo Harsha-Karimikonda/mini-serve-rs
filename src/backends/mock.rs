@@ -69,6 +69,19 @@ impl ModelBackend for MockBackend {
         &self.name
     }
 
+    fn format_chat(
+        &self,
+        messages: &[crate::core::types::ChatMessage],
+    ) -> Result<String, EngineError> {
+        crate::backends::chat::validate_messages(messages)?;
+        let mut prompt = String::new();
+        for message in messages {
+            prompt.push_str(&format!("{}: {}\n", message.role, message.content));
+        }
+        prompt.push_str("assistant: ");
+        Ok(prompt)
+    }
+
     async fn init_sequence(&self, prompt: &str) -> Result<Vec<u32>, EngineError> {
         // Approximate token count by whitespace splitting
         let words: Vec<&str> = prompt.split_whitespace().collect();

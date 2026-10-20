@@ -4,6 +4,14 @@ Completed changes must include an actual GPU inference run, in addition to CPU
 regressions and feature builds. This project rule is recorded in [AGENTS.md](../AGENTS.md).
 If GPU access or weights are unavailable, GPU verification stays pending.
 
+## Current change awaiting verification (2026-10-20)
+
+Chat formatting and model identity have changed since the recorded Metal runs.
+Their GPU gate is **pending**; historical passes do not validate this change.
+The gate now supports explicit Metal/CUDA selection and chat comparisons;
+see [current commands and blockers](chat_correctness.md#gpu-gate-and-colabcuda).
+Local runs also need `tokenizer_config.json` alongside the original artifacts.
+
 ## Repeatable check
 
 Prerequisites: macOS with a Metal GPU and local `config.json`, `tokenizer.json`,

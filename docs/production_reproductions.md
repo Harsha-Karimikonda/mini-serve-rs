@@ -1,5 +1,10 @@
 # Production blocker investigation record
 
+**2026-10-20 update:** The chat-format assertion below is now enabled and passes
+with backend-owned artifact templates. Its old ignored-test commands and
+expected failure describe the historical investigation. GPU validation of the
+new change remains pending; see [current verification](chat_correctness.md).
+
 Historical measurements executed on **2026-10-16** against the working tree at the time. These are focused reproductions, not a production load test or a throughput benchmark. Implementation work continued during the review: tensor reservations and shared stop handling were present in the code tested here.
 
 ## Results

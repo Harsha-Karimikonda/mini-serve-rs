@@ -58,3 +58,62 @@ async fn test_latency_aware_routing_balances_traffic() {
     let chosen_next = router.choose_worker().unwrap();
     assert_eq!(chosen_next.id, "worker-2");
 }
+
+#[tokio::test]
+async fn model_routing_never_selects_a_different_loaded_model() {
+    let workers: Vec<_> = ["alpha", "beta", "alpha"]
+        .into_iter()
+        .map(|name| {
+            Arc::new(Scheduler::new(
+                4,
+                32,
+                create_shared_cache(64, 16),
+                create_shared_prefix_cache(16, 8),
+                Arc::new(MockBackend::new(name, 0)),
+            ))
+        })
+        .collect();
+    let router = Router::new(
+        workers
+            .iter()
+            .enumerate()
+            .map(|(i, w)| WorkerHandle::new(i.to_string(), w.clone()))
+            .collect(),
+    );
+    assert_eq!(router.model_names(), ["alpha", "beta"]);
+    // Leave loops stopped to make queue admission observable.
+    let _first = router
+        .submit_model(
+            "beta",
+            RequestId("first".into()),
+            "hello".into(),
+            SamplingParams::default(),
+        )
+        .await
+        .unwrap();
+    let messages = vec![rlse::core::types::ChatMessage {
+        role: "user".into(),
+        content: "hello".into(),
+    }];
+    let _second = router
+        .submit_chat(
+            "beta",
+            RequestId("second".into()),
+            &messages,
+            SamplingParams::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(workers[0].queue_depth(), 0);
+    assert_eq!(workers[1].queue_depth(), 2);
+    assert_eq!(workers[2].queue_depth(), 0);
+    assert!(router
+        .submit_model(
+            "missing",
+            RequestId("bad".into()),
+            "hello".into(),
+            SamplingParams::default()
+        )
+        .await
+        .is_err());
+}

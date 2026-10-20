@@ -66,6 +66,10 @@ impl Scheduler {
         }
     }
 
+    pub fn backend(&self) -> &dyn ModelBackend {
+        self.backend.as_ref()
+    }
+
     pub fn is_healthy(&self) -> bool {
         self.accepting.load(Ordering::Acquire) && self.backend.is_healthy()
     }

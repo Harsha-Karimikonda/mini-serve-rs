@@ -78,6 +78,14 @@ data: [DONE]
 
 ### B. Chat Completions (`POST /v1/chat/completions`)
 
+Chat uses the loaded model's `tokenizer_config.json` string chat template.
+Supported roles are `system`, `user`, and `assistant`, with text content.
+Missing/unsupported templates return HTTP 400; ordinary completions remain
+available. Model names on both inference endpoints must exactly match
+`GET /v1/models`. Only loaded identities are listed; explicit mock fallback is
+reported as `mock`. See [behavior and verification](chat_correctness.md).
+
+
 #### Request Body
 ```json
 {

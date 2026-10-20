@@ -1,7 +1,7 @@
 CARGO ?= cargo
 FEATURES ?= metal
 
-.PHONY: all build run test bench lint fmt clean gpu-check
+.PHONY: all build run test bench lint fmt clean gpu-check cuda-check
 
 all: build
 
@@ -35,4 +35,8 @@ clean:
 
 # Explicit pretrained Metal inference; requires local Qwen3-0.6B weights.
 gpu-check:
-	$(CARGO) test --locked --features metal --test test_gpu_inference -- --ignored --nocapture
+	RLSE_GPU_DEVICE=metal $(CARGO) test --locked --features metal --test test_gpu_inference -- --ignored --nocapture
+
+# Run inside a CUDA host (e.g. Colab), with local Qwen3 pretrained weights.
+cuda-check:
+	RLSE_GPU_DEVICE=cuda $(CARGO) test --locked --features cuda --test test_gpu_inference -- --ignored --nocapture

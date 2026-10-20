@@ -95,7 +95,13 @@ Run the full automated test suite:
 ```bash
 make test
 ```
-The default suite runs 49 unit and integration tests, including CPU tensor regressions for interleaved workers and prefix restoration, channel saturation, cancellation, API termination, configuration/request boundaries, tensor budgeting, and shared stop handling. The pretrained Qwen3 test and four manual diagnostics (chat formatting, runtime blocking, registry contention, and real-model health latency) are explicitly ignored by default. Metal-feature builds also discover a separately ignored GPU integration gate, run explicitly below. Place its tokenizer, config, and safetensors in `models/Qwen3-0.6B`, then run:
+The default suite covers CPU tensor regressions, scheduling, streaming, validation,
+stop handling, artifact-defined Qwen chat formatting, and actual model identity.
+Pretrained inference and artifact-dependent token-ID checks are explicitly opt-in;
+normal Metal-feature tests still use CPU fixtures. See [chat correctness and
+current verification](docs/chat_correctness.md) for the new milestone and its
+pending GPU gate. Place tokenizer, tokenizer config, model config, and safetensors
+in `models/Qwen3-0.6B` before running pretrained tests:
 
 ```bash
 cargo test --locked --test test_qwen3 -- --ignored

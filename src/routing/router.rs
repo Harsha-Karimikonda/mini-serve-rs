@@ -61,6 +61,63 @@ impl Router {
         worker.scheduler.submit(request_id, prompt, sampling).await
     }
 
+    /// Loaded identities remain discoverable even when execution is quarantined.
+    pub fn model_names(&self) -> Vec<String> {
+        let mut names: Vec<_> = self
+            .workers
+            .iter()
+            .map(|w| w.scheduler.backend().name().to_owned())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    fn worker_for_model(&self, model: &str) -> Result<&WorkerHandle, EngineError> {
+        if !self
+            .workers
+            .iter()
+            .any(|w| w.scheduler.backend().name() == model)
+        {
+            return Err(EngineError::InvalidRequest(format!(
+                "Unknown model '{model}'"
+            )));
+        }
+        self.workers
+            .iter()
+            .filter(|w| w.scheduler.backend().name() == model && w.scheduler.is_healthy())
+            .min_by(|a, b| a.score().total_cmp(&b.score()))
+            .ok_or_else(|| {
+                EngineError::NoHealthyWorkers("No ready execution paths for model".into())
+            })
+    }
+
+    pub async fn submit_model(
+        &self,
+        model: &str,
+        request_id: RequestId,
+        prompt: String,
+        sampling: SamplingParams,
+    ) -> Result<mpsc::Receiver<TokenEvent>, EngineError> {
+        self.worker_for_model(model)?
+            .scheduler
+            .submit(request_id, prompt, sampling)
+            .await
+    }
+
+    pub async fn submit_chat(
+        &self,
+        model: &str,
+        request_id: RequestId,
+        messages: &[crate::core::types::ChatMessage],
+        sampling: SamplingParams,
+    ) -> Result<mpsc::Receiver<TokenEvent>, EngineError> {
+        crate::backends::chat::validate_messages(messages)?;
+        let worker = self.worker_for_model(model)?;
+        let prompt = worker.scheduler.backend().format_chat(messages)?;
+        worker.scheduler.submit(request_id, prompt, sampling).await
+    }
+
     pub fn all_metrics(&self) -> Vec<(String, SchedulerMetrics)> {
         self.workers
             .iter()

@@ -57,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "Failed to load Candle model: {}. Falling back to MockBackend (--allow-mock-fallback enabled).",
                         e
                     );
-                    Arc::new(MockBackend::new(&settings.model, 3))
+                    Arc::new(MockBackend::new("mock", 3))
                 } else {
                     tracing::error!(
                         "Failed to load Candle model: {}. Terminating (pass --allow-mock-fallback to override).",

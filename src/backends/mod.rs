@@ -1,4 +1,5 @@
 pub mod candle;
+pub mod chat;
 pub mod mock;
 pub mod qwen2;
 pub mod traits;

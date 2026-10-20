@@ -96,6 +96,13 @@ Cancellation is checked between forward steps. Its latency depends on the durati
 
 ## 5. Implementation Status & Active Roadmap
 
+**2026-10-20 update:** Chat templates and actual model identity are implemented
+with independent pinned Qwen CPU references. GPU verification of this milestone
+remains pending, so its delivery checkbox stays open. See [current changes,
+commands, and blockers](chat_correctness.md). Earlier dated findings below are
+historical; the ignored chat-format test is now enabled.
+
+
 See the [production blocker investigation record](production_reproductions.md) for historical 2026-10-16 measurements and retained regression checks; the manual latency and contention probes have since been removed. Those checks reproduced HTTP-runtime blocking, generic chat formatting, and backend lock contention; the tested working tree passed the focused stop-handling and tensor-reservation checks. These results do not establish driver-level memory safety or multi-thread production-server latency.
 
 | Capability | Control-Plane Layer ([`src/cache/`](../src/cache/)) | Tensor Execution Layer ([`src/backends/`](../src/backends/)) |
@@ -125,10 +132,10 @@ These ratings describe demonstrated coverage and remaining limitations, not prod
 | Area | Maturity | Assessment |
 | :--- | :--- | :--- |
 | **Control plane & continuous batching** | **Medium–High** | Admission, cancellation, worker-state isolation, and reserved terminal delivery have regression coverage. Quarantined-backend routing is implemented. Worker supervision and bounded shutdown remain open. Channel saturation terminates the slow request explicitly; it does not pause batch progress. |
-| **API protocol & streaming** | **Medium** | JSON/SSE completion and explicit termination/error behavior are tested. Model identity checks and model-specific chat templates remain incomplete. |
+| **API protocol & streaming** | **Medium** | JSON/SSE completion and explicit termination/error behavior are tested. Model identity and artifact-defined chat templates have CPU coverage as of 2026-10-20; their GPU verification remains pending. |
 | **Inference & device kernels** | **Medium** | CPU fixtures cover grouped-query attention, batched decode, prefix restoration, and interleaved workers. Pretrained Metal cached/uncached greedy output and two-worker comparisons now pass the focused GPU gate. The shared backend mutex still serializes workers, and synchronous inference runs inside async tasks. Numeric GPU logit comparisons and broader device/load coverage remain open. |
 | **Memory & KV cache management** | **Low for production memory control** | Logical block accounting coexists with real contiguous KV tensors and cached prefix activations. Physical paging is absent. Tensor-memory reservations, prefix eviction, cancellation release, and admission rejection are verified by CPU regressions and focused pretrained Metal inference. Device allocator measurements, forced OOM/recovery, and production load bounds remain open. |
-| **Text generation & output quality** | **Low–Medium** | Prefix reuse and stop matching across tokens have CPU and focused pretrained Metal checks. Proper chat formatting remains open. Pretrained output quality requires broader evaluation beyond these targeted checks. |
+| **Text generation & output quality** | **Low–Medium** | Prefix reuse and stop matching across tokens have CPU and focused pretrained Metal checks. Artifact-defined chat formatting has CPU/reference coverage; pretrained GPU chat verification remains pending. Pretrained output quality requires broader evaluation beyond these targeted checks. |
 | **Production operations & security** | **Low** | CI and pre-commit checks exist; hosted CI execution is not yet recorded. API-key authentication, per-client quotas, worker supervision, and bounded draining remain open. Existing queue limits provide overload protection, not per-client rate limiting. |
 
 Returned Candle execution errors now quarantine the shared backend and trigger explicit request cleanup; see the [failure policy](device_failures.md). Reservation pressure is recoverable. This does not establish proactive GPU-memory protection or in-process device recovery after OOM.

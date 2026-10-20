@@ -94,7 +94,8 @@ async fn dashboard_handler() -> Html<&'static str> {
 async fn health_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(json!({
         "status": "ok",
-        "model": state.settings.model,
+        "model": state.router.model_names().first(),
+        "models": state.router.model_names(),
         "device": state.settings.device,
         "workers": state.router.workers().len(),
     }))
@@ -116,20 +117,17 @@ async fn models_handler(State(state): State<AppState>) -> Json<ModelListResponse
     let now = now_secs();
     Json(ModelListResponse {
         object: "list".to_string(),
-        data: vec![
-            ModelCard {
-                id: state.settings.model.clone(),
-                object: "model".to_string(),
+        data: state
+            .router
+            .model_names()
+            .into_iter()
+            .map(|id| ModelCard {
+                id,
+                object: "model".into(),
                 created: now,
-                owned_by: "rlse".to_string(),
-            },
-            ModelCard {
-                id: "mock".to_string(),
-                object: "model".to_string(),
-                created: now,
-                owned_by: "system".to_string(),
-            },
-        ],
+                owned_by: "rlse".into(),
+            })
+            .collect(),
     })
 }
 
@@ -156,7 +154,7 @@ async fn completions_handler(
 
     let rx = state
         .router
-        .submit(request_id.clone(), req.prompt, sampling)
+        .submit_model(&req.model, request_id.clone(), req.prompt, sampling)
         .await?;
 
     if req.stream {
@@ -264,13 +262,6 @@ async fn chat_completions_handler(
         ));
     }
 
-    // Format chat messages into prompt
-    let mut prompt = String::new();
-    for msg in &req.messages {
-        prompt.push_str(&format!("{}: {}\n", msg.role, msg.content));
-    }
-    prompt.push_str("assistant: ");
-
     let request_id = RequestId::new_chat();
     let sampling = SamplingParams {
         temperature: req.temperature,
@@ -281,7 +272,7 @@ async fn chat_completions_handler(
 
     let rx = state
         .router
-        .submit(request_id.clone(), prompt, sampling)
+        .submit_chat(&req.model, request_id.clone(), &req.messages, sampling)
         .await?;
 
     if req.stream {
@@ -412,7 +403,8 @@ async fn status_handler(State(state): State<AppState>) -> Json<serde_json::Value
         "status": if state.router.choose_worker().is_ok() { "healthy" } else { "unavailable" },
         "engine": "rlse",
         "version": "0.2.0",
-        "model": state.settings.model,
+        "model": state.router.model_names().first(),
+        "models": state.router.model_names(),
         "tokens_per_sec": state.telemetry.tokens_per_second(),
         "total_tokens": state.telemetry.total_tokens(),
         "total_requests": state.telemetry.total_requests(),

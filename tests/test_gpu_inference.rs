@@ -1,5 +1,5 @@
 //! Explicit GPU completion gate; fails rather than falling back to CPU or skipping its body.
-#![cfg(feature = "metal")]
+#![cfg(any(feature = "metal", feature = "cuda"))]
 
 use std::{
     sync::{
@@ -40,6 +40,12 @@ struct FaultAfterForward {
 impl ModelBackend for FaultAfterForward {
     fn name(&self) -> &str {
         self.model.name()
+    }
+    fn format_chat(
+        &self,
+        messages: &[rlse::core::types::ChatMessage],
+    ) -> Result<String, rlse::core::errors::EngineError> {
+        self.model.format_chat(messages)
     }
     fn context_length(&self) -> Option<usize> {
         self.model.context_length()
@@ -158,12 +164,18 @@ async fn generate(worker: &Scheduler, prompt: &str, max_tokens: usize) -> Output
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires host Metal GPU access and local Qwen3-0.6B pretrained weights"]
+#[ignore = "requires explicit GPU access and local Qwen3-0.6B pretrained weights"]
 async fn pretrained_gpu_memory_prefix_stops_and_workers() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let started = std::time::Instant::now();
+    let model_dir = std::env::var("RLSE_GPU_MODEL_DIR").unwrap_or_else(|_| MODEL.into());
+    let device = std::env::var("RLSE_GPU_DEVICE").unwrap_or_else(|_| "metal".into());
     assert!(
-        std::path::Path::new(MODEL)
+        matches!(device.as_str(), "metal" | "cuda"),
+        "select an explicit GPU device"
+    );
+    assert!(
+        std::path::Path::new(&model_dir)
             .join("model.safetensors")
             .is_file(),
         "local pretrained weights are required"
@@ -174,13 +186,17 @@ async fn pretrained_gpu_memory_prefix_stops_and_workers() {
         128,
         budget.clone(),
     )));
-    let mut model = CandleBackend::load_hf(MODEL, "metal").unwrap();
+    let mut model = CandleBackend::load_hf(&model_dir, &device).unwrap();
     assert!(
-        matches!(model.device(), candle_core::Device::Metal(_)),
+        match device.as_str() {
+            "metal" => matches!(model.device(), candle_core::Device::Metal(_)),
+            "cuda" => matches!(model.device(), candle_core::Device::Cuda(_)),
+            _ => false,
+        },
         "GPU gate cannot use CPU fallback"
     );
     println!(
-        "ACTUAL_DEVICE={:?}; model={MODEL}; greedy temperature=0 top_p=1",
+        "ACTUAL_DEVICE={:?}; model={model_dir}; greedy temperature=0 top_p=1",
         model.device()
     );
     model.try_set_prefix_cache(prefix.clone()).unwrap();
@@ -215,8 +231,8 @@ async fn pretrained_gpu_memory_prefix_stops_and_workers() {
         prefix_cache: prefix.clone(),
         telemetry: create_telemetry(),
         settings: Settings {
-            model: MODEL.into(),
-            device: "metal".into(),
+            model: model_dir.clone(),
+            device: device.clone(),
             tensor_memory_budget_bytes: 512 * 1024 * 1024,
             execution_headroom_bytes: 32 * 1024 * 1024,
             ..Settings::default()
@@ -252,6 +268,78 @@ async fn pretrained_gpu_memory_prefix_stops_and_workers() {
     );
     println!("PASS: exact prefix with logits, exact prefix without logits, partial prefix outputs match uncached reference");
 
+    let fixture: Value =
+        serde_json::from_str(include_str!("fixtures/chat/qwen3-reference.json")).unwrap();
+    let case = &fixture["cases"][0];
+    let reference_prompt = case["rendered"].as_str().unwrap();
+    let expected_ids: Vec<u32> = serde_json::from_value(case["token_ids"].clone()).unwrap();
+    assert_eq!(
+        model.init_sequence(reference_prompt).await.unwrap(),
+        expected_ids,
+        "local tokenizer must match the pinned reference token IDs"
+    );
+    let messages: Vec<rlse::core::types::ChatMessage> =
+        serde_json::from_value(case["messages"].clone()).unwrap();
+    assert_eq!(
+        model.format_chat(&messages).unwrap(),
+        reference_prompt,
+        "local chat metadata must match the pinned reference fixture"
+    );
+    let chat_reference = generate(&workers[0], reference_prompt, 12).await;
+    for stream in [false, true] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"model":model_dir, "messages":case["messages"],
+                "temperature":0, "top_p":1, "max_tokens":12, "stream":stream})
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = if stream {
+            let sse = std::str::from_utf8(&body).unwrap();
+            assert!(sse.ends_with("data: [DONE]\n\n"));
+            sse.lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter(|data| *data != "[DONE]")
+                .map(|data| {
+                    let chunk: Value = serde_json::from_str(data).unwrap();
+                    assert_eq!(chunk["model"], model_dir);
+                    assert!(chunk.get("error").is_none());
+                    chunk["choices"][0]["delta"]["content"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_owned()
+                })
+                .collect::<String>()
+        } else {
+            let response: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(response["model"], model_dir);
+            assert_eq!(
+                response["usage"]["prompt_tokens"],
+                chat_reference.usage.prompt_tokens
+            );
+            response["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(
+            text, chat_reference.text,
+            "chat route differs from reference-formatted completion"
+        );
+    }
+    println!("PASS: JSON/SSE chat agrees with pinned reference-formatted completion");
+
     let nonempty: Vec<_> = plain.fragments.iter().filter(|s| !s.is_empty()).collect();
     assert!(nonempty.len() >= 3);
     let single = nonempty[0].to_string();
@@ -272,7 +360,7 @@ async fn pretrained_gpu_memory_prefix_stops_and_workers() {
     ] {
         for streaming in [false, true] {
             let response = app.clone().oneshot(Request::builder().method("POST").uri("/v1/completions").header("content-type", "application/json")
-                .body(Body::from(json!({"model": MODEL, "prompt": PROMPT, "temperature": 0, "max_tokens": 12, "stop": [stop], "stream": streaming}).to_string())).unwrap()).await.unwrap();
+                .body(Body::from(json!({"model": model_dir, "prompt": PROMPT, "temperature": 0, "max_tokens": 12, "stop": [stop], "stream": streaming}).to_string())).unwrap()).await.unwrap();
             assert!(response.status().is_success());
             let bytes = response.into_body().collect().await.unwrap().to_bytes();
             let mut output = String::new();
@@ -354,7 +442,7 @@ async fn pretrained_gpu_memory_prefix_stops_and_workers() {
                 .uri("/v1/completions")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    json!({"model": MODEL, "prompt": PROMPT, "temperature": 0, "max_tokens": 4000})
+                    json!({"model": model_dir, "prompt": PROMPT, "temperature": 0, "max_tokens": 4000})
                         .to_string(),
                 ))
                 .unwrap(),
@@ -380,7 +468,7 @@ async fn pretrained_gpu_memory_prefix_stops_and_workers() {
     fault.remaining.store(2, Ordering::SeqCst);
     let response = app.clone().oneshot(Request::builder().method("POST").uri("/v1/completions")
         .header("content-type", "application/json")
-        .body(Body::from(json!({"model":MODEL, "prompt":PROMPT, "temperature":0, "max_tokens":128, "stream":true}).to_string())).unwrap()).await.unwrap();
+        .body(Body::from(json!({"model":model_dir, "prompt":PROMPT, "temperature":0, "max_tokens":128, "stream":true}).to_string())).unwrap()).await.unwrap();
     assert!(response.status().is_success());
     let body = tokio::time::timeout(Duration::from_secs(30), response.into_body().collect())
         .await
@@ -421,7 +509,7 @@ async fn pretrained_gpu_memory_prefix_stops_and_workers() {
                 .uri("/v1/completions")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    json!({"model":MODEL, "prompt":PROMPT, "max_tokens":12}).to_string(),
+                    json!({"model":model_dir, "prompt":PROMPT, "max_tokens":12}).to_string(),
                 ))
                 .unwrap(),
         )
@@ -431,7 +519,7 @@ async fn pretrained_gpu_memory_prefix_stops_and_workers() {
         rejected.status(),
         axum::http::StatusCode::SERVICE_UNAVAILABLE
     );
-    println!("PASS: injected returned failure after real Metal prefill/decode emits SSE error, quarantines both shared workers, clears active/prefix reservations, makes readiness and subsequent admission return 503; no automatic retry");
+    println!("PASS: injected returned failure after real GPU prefill/decode emits SSE error, quarantines both shared workers, clears active/prefix reservations, makes readiness and subsequent admission return 503; no automatic retry");
     for worker in &workers {
         worker.shutdown();
     }

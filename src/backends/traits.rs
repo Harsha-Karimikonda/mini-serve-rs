@@ -1,5 +1,5 @@
 use crate::core::errors::EngineError;
-use crate::core::types::{ActiveSequence, RequestId};
+use crate::core::types::{ActiveSequence, ChatMessage, RequestId};
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -15,6 +15,12 @@ pub struct StepToken {
 #[async_trait]
 pub trait ModelBackend: Send + Sync {
     fn name(&self) -> &str;
+    /// Render the loaded model's chat template before tokenization and caching.
+    fn format_chat(&self, _messages: &[ChatMessage]) -> Result<String, EngineError> {
+        Err(EngineError::InvalidRequest(
+            "Chat template unavailable for this backend; use /v1/completions".into(),
+        ))
+    }
     /// Shared execution health. Stateful backends must publish quarantine to all workers.
     fn is_healthy(&self) -> bool {
         true

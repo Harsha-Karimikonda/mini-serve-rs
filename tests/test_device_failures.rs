@@ -61,6 +61,12 @@ impl ModelBackend for FaultBackend {
     fn mark_unhealthy(&self) {
         self.healthy.store(false, Ordering::SeqCst);
     }
+    fn format_chat(
+        &self,
+        messages: &[rlse::core::types::ChatMessage],
+    ) -> Result<String, EngineError> {
+        MockBackend::new("mock", 0).format_chat(messages)
+    }
     async fn init_sequence(&self, _: &str) -> Result<Vec<u32>, EngineError> {
         self.tokenizations.fetch_add(1, Ordering::SeqCst);
         Ok(vec![1])
@@ -145,7 +151,7 @@ async fn allocation_and_device_failures_quarantine_and_report_readiness() {
                     // Both workers have queued work when the first execution path fails.
                     let mut queued = workers[1].submit(RequestId("queued".into()), "hello".into(), params()).await.unwrap();
                     let handle = workers[0].start_loop();
-                    let payload = json!({"model":"mock", "prompt":"hello", "messages":[{"role":"user","content":"hello"}], "max_tokens":4, "stream":stream});
+                    let payload = json!({"model":"fault", "prompt":"hello", "messages":[{"role":"user","content":"hello"}], "max_tokens":4, "stream":stream});
                     let response = request(app.clone(), path, Some(payload.clone())).await;
                     assert_eq!(response.status(), if stream { StatusCode::OK } else { StatusCode::INTERNAL_SERVER_ERROR });
                     let body = bytes(response).await;

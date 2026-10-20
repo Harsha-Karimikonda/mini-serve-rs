@@ -177,11 +177,15 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       let tokenCount = 0;
 
       try {
+        const modelsResponse = await fetch('/v1/models');
+        if (!modelsResponse.ok) throw new Error('Could not load serving model');
+        const models = await modelsResponse.json();
+        if (!models.data.length) throw new Error('No model available');
         const res = await fetch('/v1/completions', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            model: 'mock',
+            model: models.data[0].id,
             prompt: prompt,
             max_tokens: 128,
             stream: true

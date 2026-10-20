@@ -25,6 +25,7 @@ pub struct CandleBackend {
     healthy: AtomicBool,
     device: Device,
     tokenizer: Tokenizer,
+    chat_template: Result<crate::backends::chat::ChatTemplate, String>,
     model_template: Arc<QwenModel>,
     active_models: Mutex<Vec<(RequestId, QwenModel)>>,
     eos_token_id: u32,
@@ -45,7 +46,7 @@ impl CandleBackend {
         let local_slug_path = std::path::Path::new("models").join(&normalized_slug);
         let local_models_path = std::path::Path::new("models").join(model_id);
 
-        let (tokenizer_path, config_path, model_paths) = if local_path.is_dir()
+        let (tokenizer_path, config_path, model_paths, chat_config_path) = if local_path.is_dir()
             && (local_path.join("model.safetensors").exists()
                 || local_path.join("model.safetensors.index.json").exists())
         {
@@ -60,6 +61,7 @@ impl CandleBackend {
                 local_path.join("tokenizer.json"),
                 local_path.join("config.json"),
                 weights,
+                Some(local_path.join("tokenizer_config.json")),
             )
         } else if local_slug_path.is_dir()
             && (local_slug_path.join("model.safetensors").exists()
@@ -78,6 +80,7 @@ impl CandleBackend {
                 local_slug_path.join("tokenizer.json"),
                 local_slug_path.join("config.json"),
                 weights,
+                Some(local_slug_path.join("tokenizer_config.json")),
             )
         } else if local_models_path.is_dir()
             && (local_models_path.join("model.safetensors").exists()
@@ -99,6 +102,7 @@ impl CandleBackend {
                 local_models_path.join("tokenizer.json"),
                 local_models_path.join("config.json"),
                 weights,
+                Some(local_models_path.join("tokenizer_config.json")),
             )
         } else {
             info!("Fetching model {} from Hugging Face hub...", model_id);
@@ -129,11 +133,25 @@ impl CandleBackend {
                 .get("config.json")
                 .map_err(|e| EngineError::BackendError(format!("Failed to fetch config: {}", e)))?;
             let weights = resolve_model_weights_hf(&repo)?;
-            (tok, cfg, weights)
+            let chat = repo
+                .get("tokenizer_config.json")
+                .inspect_err(|e| {
+                    tracing::warn!("Chat metadata unavailable: {e}; completions remain available");
+                })
+                .ok();
+            (tok, cfg, weights, chat)
         };
 
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| EngineError::BackendError(format!("Failed to load tokenizer: {}", e)))?;
+
+        let chat_template = chat_config_path
+            .ok_or_else(|| "tokenizer_config.json unavailable".to_owned())
+            .and_then(|path| std::fs::read_to_string(path).map_err(|e| e.to_string()))
+            .and_then(|source| crate::backends::chat::ChatTemplate::from_config(&source));
+        if let Err(error) = &chat_template {
+            tracing::warn!("Chat unavailable: {error}; completions remain available");
+        }
 
         let config_str = std::fs::read_to_string(&config_path)
             .map_err(|e| EngineError::BackendError(format!("Failed to read config: {}", e)))?;
@@ -192,6 +210,7 @@ impl CandleBackend {
             healthy: AtomicBool::new(true),
             device,
             tokenizer,
+            chat_template,
             model_template: Arc::new(model),
             active_models: Mutex::new(Vec::new()),
             eos_token_id,
@@ -284,6 +303,20 @@ impl CandleBackend {
 
 #[async_trait]
 impl ModelBackend for CandleBackend {
+    fn format_chat(
+        &self,
+        messages: &[crate::core::types::ChatMessage],
+    ) -> Result<String, EngineError> {
+        self.chat_template
+            .as_ref()
+            .map_err(|reason| {
+                EngineError::InvalidRequest(format!(
+                    "Chat template unavailable: {reason}; use /v1/completions"
+                ))
+            })?
+            .render(messages)
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -834,6 +867,7 @@ mod correctness_tests {
         );
         CandleBackend {
             name: "tiny-stop-test".into(),
+            chat_template: Err("CPU fixture".into()),
             healthy: AtomicBool::new(true),
             device: Device::Cpu,
             tokenizer,
@@ -926,6 +960,7 @@ mod correctness_tests {
         .unwrap();
         CandleBackend {
             name: "tiny-test".into(),
+            chat_template: Err("CPU fixture".into()),
             healthy: AtomicBool::new(true),
             device: Device::Cpu,
             tokenizer: Tokenizer::new(tokenizers::models::wordlevel::WordLevel::default()),
