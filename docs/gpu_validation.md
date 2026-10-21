@@ -4,6 +4,41 @@ Completed changes must include an actual GPU inference run, in addition to CPU
 regressions and feature builds. This project rule is recorded in [AGENTS.md](../AGENTS.md).
 If GPU access or weights are unavailable, GPU verification stays pending.
 
+## Colab CUDA harness execution record: 2026-10-21
+
+Executed [`docs/colab_cuda_kernels/test_colab.ipynb`](colab_cuda_kernels/test_colab.ipynb)
+against a remote Google Colab NVIDIA GPU runtime from local VS Code using the
+embedded source archive workflow (`scripts/gpu_validation.py run --device cuda
+--model-dir /content/rlse-models/Qwen3-0.6B --cache-dir /content/rlse-target
+--include-kernels --include-server --output /content/rlse-evidence-<uuid>`).
+
+Observed results from `results.json` after ~11 minutes (cold build + execution):
+
+- **Actual GPU device established:** `actual_device: ["Cuda(CudaDevice(DeviceId(1)))"]`.
+- **Model artifacts verified:** `artifacts_verified: true` (`Qwen/Qwen3-0.6B`,
+  revision `c1899de289a04d12100db370d81485cdf75e47ca`, all four SHA-256 hashes
+  verified in `/content/rlse-models/Qwen3-0.6B`).
+- **Build target cache:** `/content/rlse-target/76e8141574039a4d8824c0e9`.
+- **Commands `00.log` through `12.log` passed (`exit_code: 0`):**
+  - Toolchain & GPU discovery (`rustc --version --verbose`, `cargo --version`,
+    `nvcc --version`, `nvidia-smi` queries).
+  - CPU & Python regressions (`cargo fmt --all --check`,
+    `cargo test --locked --all-targets`,
+    `python3 -m unittest discover -s scripts/tests -v`).
+  - CUDA feature lint & test build (`cargo clippy --locked --features cuda --all-targets -- -D warnings`,
+    `cargo test --locked --features cuda --all-targets`).
+  - **Pretrained CUDA Gate 1 (`test_gpu_inference`):** **PASSED** on
+    `Cuda(CudaDevice(DeviceId(1)))` (`cargo test --locked --features cuda --test test_gpu_inference -- --ignored --nocapture`).
+  - **Pretrained CUDA Gate 2 (`test_pretrained_quality`):** **PASSED** on
+    `Cuda(CudaDevice(DeviceId(1)))` (`cargo test --locked --features cuda --test test_pretrained_quality -- --ignored --nocapture`).
+- **Overall harness status: `failed` at `13.log` (`test_pretrained_numerics`):**
+  - Command `cargo test --locked --features cuda --test test_pretrained_numerics -- --ignored --nocapture`
+    exited with code `101` (`see 13.log`).
+  - Because `13.log` failed before the post-gate steps, `scripts/validate_cuda_kernels.py`
+    and `scripts/validate_gpu_server.py` did not execute in that run, and
+    `test_pretrained_numerics` is now gated behind `--include-numerics` pending
+    inspection of `13.log` on CUDA.
+
 ## Live progress reporting commit verification: 2026-10-21
 
 Added optional `tqdm` download/command/kernel progress, streamed log messages
