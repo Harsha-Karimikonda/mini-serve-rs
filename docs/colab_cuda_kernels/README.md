@@ -15,7 +15,7 @@ This folder documents the workflow for connecting a local macOS development work
 | [`path_forward.md`](path_forward.md) | Staged CUDA correctness, kernel integration, hardware/model acceptance matrix, rollout criteria, and TPU feasibility plan. |
 | [`cuda_kernels_and_ffi.md`](cuda_kernels_and_ffi.md) | Deep dive into the two prototype CUDA kernels (`fused_rmsnorm_kernel` and `paged_gqa_decode_attention_kernel<16, 128>`), memory layout, and Rust FFI linkage. |
 | [`mini_serve_kernels.cu`](mini_serve_kernels.cu) | Standalone CUDA C++ source implementing fused RMSNorm and non-contiguous 16-token Paged GQA Decode Attention for `Qwen3-0.6B` (`num_heads=16, num_kv_heads=8, head_dim=128`). |
-| [`test_colab.ipynb`](test_colab.ipynb) | Interactive Colab notebook executable directly from the VS Code Colab extension. |
+| [`test_colab.ipynb`](test_colab.ipynb) | Thin Colab interface for source upload, pinned artifacts, and evidence download. |
 
 ---
 
@@ -29,24 +29,24 @@ When connected to a Google Colab runtime via the VS Code Colab extension:
 
 ---
 
-## 2. Fast Codebase Sync Workflow (Mac → Colab VM)
+## 2. Repeatable Source Sync and Validation
 
-Because the Colab VM has an isolated filesystem, local files are not mounted automatically. Instead of uploading ~100 Rust files individually, [`test_colab.ipynb`](test_colab.ipynb) uses a single-command compressed archive sync:
+Use the [validation workflow](validation_workflow.md) and thin
+[`test_colab.ipynb`](test_colab.ipynb) notebook. Package the current selected source
+with `python3 scripts/gpu_validation.py pack --output /tmp/rlse-source.tar.gz`,
+then upload the archive, sidecar, and matching script. The harness verifies source
+and pinned model hashes, runs CPU and explicit GPU checks, and exports evidence.
+The notebook no longer embeds CUDA source, generated Rust tests, or a stale
+archive, and does not kill unrelated processes.
 
-1. **Pack on macOS (`~80 KB`):**
-   ```bash
-   git archive --format=tar.gz HEAD | base64
-   ```
-2. **Unpack on Colab VM (`/content/mini-serve-rs`):**
-   - Decodes the `base64` payload into `/tmp/repo.tar.gz`, extracts it to `/content/mini-serve-rs`, and deletes `/tmp/repo.tar.gz`.
-   - Kills any stale background `cargo`/`rustc` processes (`pkill -f "cargo|rustc|rustup"`) from interrupted notebook cells so `.cargo/.package-cache` locks are never held.
-   - **Incremental compilation cache:** Preserves `/content/mini-serve-rs/target` across cell re-runs. The initial cold build of ~260 crates takes ~2.5–3 minutes on a Colab CPU; subsequent incremental edits and `cargo test` runs finish in **< 2 seconds**.
+The records below describe the earlier prototype notebook. They remain historical
+setup evidence; the current notebook runs the repository's pretrained gates.
 
 ---
 
 ## 3. Verification Record (2026-10-20)
 
-### 3.1 Hardware Environments Tested
+### 3.1 Hardware Environments Tested (historical prototype notebook)
 - **NVIDIA A100-SXM4-40GB** (`Driver 580.82.07`, `CUDA 13.0`, 42.41 GB VRAM) — verified `nvidia-smi` and PyTorch CUDA runtime initialization in [`test_colab.ipynb`](test_colab.ipynb) Cells 1–2.
 - **NVIDIA Tesla T4** (`sm_75`) — verified custom CUDA kernel compilation (`nvcc -O3 -arch=sm_75 --shared`), Rust toolchain bootstrap (`rustup` minimal profile), codebase unpack (`/content/mini-serve-rs`), and Rust `KVCache` + FFI test execution in [`test_colab.ipynb`](test_colab.ipynb) Cells 4–5.
 

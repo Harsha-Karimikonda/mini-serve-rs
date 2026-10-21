@@ -45,6 +45,14 @@ jobs:
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
 
+      - name: Setup Python for GPU harness regressions
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Test GPU validation harness (no GPU required)
+        run: python3 -m unittest discover -s scripts/tests -v
+
       - name: Run tests (CPU)
         run: cargo test --locked --all-targets
 

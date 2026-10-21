@@ -4,6 +4,268 @@ Completed changes must include an actual GPU inference run, in addition to CPU
 regressions and feature builds. This project rule is recorded in [AGENTS.md](../AGENTS.md).
 If GPU access or weights are unavailable, GPU verification stays pending.
 
+## Commit recheck: 2026-10-21
+
+Commands used to recheck the staged change set (run before staging):
+
+```bash
+python3 -m unittest discover -s scripts/tests -v
+/Users/hkarimkonda/.cargo/bin/cargo test --locked --all-targets
+/Users/hkarimkonda/.cargo/bin/cargo fmt --all --check
+/Users/hkarimkonda/.cargo/bin/cargo clippy --locked --all-targets -- -D warnings
+/Users/hkarimkonda/.cargo/bin/cargo clippy --locked --features metal --all-targets -- -D warnings
+/usr/bin/env PATH=/Users/hkarimkonda/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin RLSE_GPU_DEVICE=metal RLSE_GPU_MODEL_DIR=models/Qwen3-0.6B /Users/hkarimkonda/.cargo/bin/cargo test --locked --features metal --test test_gpu_inference --test test_pretrained_quality --test test_pretrained_numerics -- --ignored --nocapture
+python3 scripts/validate_cuda_kernels.py --output /tmp/rlse-precommit-cuda-kernels.json
+python3 scripts/gpu_validation.py pack --output /tmp/rlse-precommit-source.tar.gz
+system_profiler SPDisplaysDataType
+git diff --check
+```
+
+Python: **7 passed**. CPU: **80 passed, two ignored** with host localhost
+access; the sandbox attempt failed three shutdown tests because socket binding
+was denied. Formatting and both Clippy configurations passed. All four notebook
+code cells compile as Python and contain no stored outputs. Source packaging
+succeeded with 100 selected files before this entry was added.
+
+The sandbox Metal attempt failed during device discovery before inference;
+only the host-access rerun can provide GPU evidence. CUDA kernel validation
+exited 1 because `nvcc` is unavailable on this Apple M4 host. CUDA compilation,
+custom-kernel correctness/performance, and pretrained CUDA inference remain
+**pending**; Metal evidence does not verify those paths.
+
+Host GPU rerun: **all three pretrained gates passed**, integration in 50.94 s,
+numeric in 143.48 s, and independent generation reference in 5.52 s. Actual
+device: `Metal(MetalDevice(DeviceId(1)))`, Apple M4, 8 GPU cores. Local model:
+`models/Qwen3-0.6B`, `Qwen/Qwen3-0.6B`, revision
+`c1899de289a04d12100db370d81485cdf75e47ca`; all four artifact hashes matched
+`tests/fixtures/generation/qwen3-reference.json`. Sampling: greedy, temperature
+0, top-p 1; integration/reference token limits are recorded below. Numeric
+comparison uses GPU/F16 and CPU/F32 with three teacher-forced decode steps.
+All 32 logit comparisons passed with finite values and identical greedy argmax;
+worst CPU/GPU maximum absolute error was 0.153257, RMS 0.038059. Restored-prefix
+maximum/RMS were 0.109375/0.020940; batched/single were 0.121094/0.025872.
+All four independent token/text references matched. Integration counters were
+31 accepted, 27 completed, 2 injected errors, 2 cancellations, and 279 generated
+tokens, with active/prefix reservations returned to zero. These focused checks
+retain the model, context, and performance limitations documented below.
+
+## Complete validation harness & advanced Colab workflow run: 2026-10-21
+
+Extended `scripts/gpu_validation.py`, `docs/colab_cuda_kernels/mini_serve_kernels.cu`,
+`scripts/validate_cuda_kernels.py`, `tests/test_pretrained_numerics.rs`, and
+`docs/colab_cuda_kernels/test_colab.ipynb`:
+
+- `scripts/gpu_validation.py` automatically prepends `~/.cargo/bin` and
+  `/usr/local/cuda/bin` when present, supports `--cache-dir` for persistent Cargo
+  build caching across unpacked Colab trees, runs `test_pretrained_numerics` in
+  addition to `test_gpu_inference` and `test_pretrained_quality`, supports
+  `--include-kernels` (`scripts/validate_cuda_kernels.py`) and `--include-server`
+  (`scripts/validate_gpu_server.py`), and supports `--embed-notebook` /
+  `clear-notebook` (`make colab-sync` / `make colab-clear`) for zero-popup VS Code
+  local-to-Colab execution while preserving deterministic clean source archives.
+- `docs/colab_cuda_kernels/mini_serve_kernels.cu` adds F16 fused RMSNorm with F32
+  variance accumulation (`fused_rmsnorm_f16_kernel`) and ragged batched tiled
+  online-softmax Paged GQA Decode Attention (`paged_gqa_decode_tiled_kernel` for
+  F32 and F16 with constant 512-byte shared memory independent of sequence length)
+  with non-exiting status-returning `extern "C"` launchers.
+- `tests/test_pretrained_numerics.rs` now supports both `RLSE_GPU_DEVICE=metal`
+  and `RLSE_GPU_DEVICE=cuda`.
+
+Exact commands run locally:
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+cargo fmt --all
+python3 -m unittest discover -s scripts/tests -v
+python3 scripts/gpu_validation.py run --device metal --include-server --output /tmp/rlse-metal-validation-live
+```
+
+Observed results on Apple M4 (`macOS-15.8.1-arm64`, 16 GB unified memory, 8 GPU
+cores, `rustc 1.99.1`, `cargo 1.99.1`, `Qwen/Qwen3-0.6B` at revision
+`c1899de289a04d12100db370d81485cdf75e47ca` with all 4 SHA-256 hashes verified):
+
+- Harness status: **`passed`** (`evidence: /private/tmp/rlse-metal-validation-live.tar.gz`,
+  SHA-256 `9561c46d4c059bb3cc72fa4075f1f60278483c9952a6906a145c3cf802d032d4`).
+- Actual device asserted and recorded across all GPU gates and server startup:
+  `Metal(MetalDevice(DeviceId(1)))`.
+- CPU & Python suites: `cargo fmt --all --check` passed (`0.118 s`), CPU
+  `cargo test --locked --all-targets` passed all **80 CPU unit/integration tests**
+  including the 5 new numeric comparison/batched-logit CPU tests (`83.856 s`),
+  and Python unit tests passed **7 tests** (`1.971 s`, including
+  `test_embed_and_clear_notebook_preserves_clean_archive`).
+- Metal feature Clippy & test build: passed (`38.499 s` and `42.053 s`).
+- Explicit GPU gate 1 (`test_gpu_inference`): **1 passed in 49.791 s** (31 accepted,
+  27 completed, 2 errors, 2 cancellations, 279 generated tokens; active/prefix
+  reservations returned to 0; peak reserved 188,183,808 bytes).
+- Explicit GPU gate 2 (`test_pretrained_quality`): **1 passed in 5.232 s** (all 4
+  cases matched independent CPU/F32 reference token IDs and text under greedy
+  sampling `temperature=0, top_p=1`).
+- Explicit GPU gate 3 (`test_pretrained_numerics`): **1 passed in 143.140 s**
+  (prefill, 16-token restored prefix, and 3 teacher-forced single/batched decode
+  steps on `Metal/F16` matched `CPU/F32` within `max_abs <= 0.153257`,
+  `rms <= 0.038059`, and batched vs single `Metal/F16` within `max_abs <= 0.121094`,
+  `rms <= 0.025872`, with identical greedy argmax decisions).
+- Live HTTP GPU server validation (`scripts/validate_gpu_server.py --device metal`):
+  **passed in 34.454 s** (3 warm prefix rounds saved 64 tokens/round, 3 cold rounds
+  saved 0 tokens/round, 14 accepted/completed, 168 generated tokens, 0 errors,
+  0 leaked KV blocks, and Ctrl-C after first SSE token drained the 12-token
+  request cleanly in `1.623 s`).
+
+Remaining limitations: CUDA execution of `gpu_validation.py run --device cuda
+--include-kernels --include-server` and `scripts/validate_cuda_kernels.py`
+requires running [`docs/colab_cuda_kernels/test_colab.ipynb`](colab_cuda_kernels/test_colab.ipynb)
+on an active Colab NVIDIA GPU runtime.
+
+## Pinned weights and pretrained Metal recheck: 2026-10-21
+
+Downloaded and hash-verified the pinned Qwen3-0.6B artifacts with the new
+harness's `download-model` command. Both pretrained gates then **passed** with
+explicit Metal selection and host GPU access. This supersedes the missing-weight
+blocker for local pretrained Metal checks; CUDA and the complete harness `run`
+workflow on an equipped host remain unverified.
+
+Exact commands:
+
+```bash
+python3 scripts/gpu_validation.py download-model
+shasum -a 256 models/Qwen3-0.6B/config.json models/Qwen3-0.6B/tokenizer.json models/Qwen3-0.6B/tokenizer_config.json models/Qwen3-0.6B/model.safetensors
+export PATH="/Users/hkarimkonda/.cargo/bin:$PATH"
+RLSE_GPU_DEVICE=metal RLSE_GPU_MODEL_DIR=models/Qwen3-0.6B cargo test --locked --features metal --test test_gpu_inference --test test_pretrained_quality -- --ignored --nocapture
+system_profiler SPDisplaysDataType
+git diff --check
+```
+
+The first sandboxed inference attempt panicked during device discovery before
+establishing a GPU. The successful host-access rerun used this exact invocation:
+
+```bash
+/usr/bin/env PATH=/Users/hkarimkonda/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin RLSE_GPU_DEVICE=metal RLSE_GPU_MODEL_DIR=models/Qwen3-0.6B /Users/hkarimkonda/.cargo/bin/cargo test --locked --features metal --test test_gpu_inference --test test_pretrained_quality -- --ignored --nocapture
+```
+
+Hardware: Apple M4, 8 GPU cores. Both gates asserted and printed
+`ACTUAL_DEVICE=Metal(MetalDevice(DeviceId(1)))`; CPU fallback did not count.
+Artifact: local `models/Qwen3-0.6B`, model `Qwen/Qwen3-0.6B`, revision
+`c1899de289a04d12100db370d81485cdf75e47ca`. All four SHA-256 values matched the
+artifact identity table below and the independent generation fixture. Weights
+remain gitignored. Build: Rust 1.99.1, Candle 0.11, F16 weights, debug/test.
+
+Sampling: greedy, temperature 0, top-p 1. Integration limits: 12 tokens for
+completion/chat/prefix/worker probes, 32 EOS, 512 cancellation, 4000 reservation
+rejection, and 128 injected returned error. Independent reference limit: 32.
+
+Observed results:
+
+- Integration: **1 passed**, zero failed/ignored, **47.61 s**. Cached/uncached
+  output equivalence, exact/partial prefix accounting, authenticated JSON/SSE
+  chat/completions, per-client quota isolation/recovery, stops/EOS, shared-worker
+  outputs, cancellation, bounded worker draining, reservation rejection/recovery,
+  and quarantine after an injected returned error following real GPU execution
+  all passed. Basic completion: ` Paris. The capital of Italy is Rome. The capital of`,
+  5 prompt tokens, 12 generated tokens, `finish_reason=length`.
+- Execution counters: 31 accepted, 27 completed, 2 errors, 2 cancellations,
+  279 generated tokens. Active and prefix reservations returned to zero; fixed
+  headroom remained 33,554,432 bytes; peak reservation was 188,183,808 bytes.
+- Independent reference: **1 passed**, zero failed/ignored, **4.79 s**. Exact
+  reference tokens/text matched instruction (`Paris.`, 7 tokens), roles
+  (`cobalt`, 7), Spanish (`Hola`, 6), and stop (`red green blue.`, 9).
+  Counts include thinking delimiters/EOS; thinking delimiters remain visible.
+  Applying the configured stop retains `red` after the delimiters.
+- Relevant CPU evidence from the immediately preceding installation recheck:
+  **75 Rust tests passed**, two opt-in ignores; **6 Python tests passed**;
+  formatting and CPU Clippy passed. Runtime source did not change between runs.
+
+Limits: this is focused pretrained Metal correctness evidence. It does not
+validate CUDA, optimized custom kernels, physical paging, the complete evidence
+runner, broader generation quality, numeric logit tolerances, production load,
+throughput, or driver OOM/hang recovery. Earlier blocked runs remain historical.
+
+## Rust installation recheck: 2026-10-21
+
+Rust is now installed at `/Users/hkarimkonda/.cargo/bin`, which was absent from
+this session's PATH. Active toolchain: `stable-aarch64-apple-darwin`;
+`cargo 1.99.1 (5f94df478 2026-08-27)` and
+`rustc 1.99.1 (58cf8f9c3 2026-10-13)`. Clippy and rustfmt are installed.
+This supersedes the earlier missing-toolchain blocker for the harness change.
+
+Exact commands:
+
+```bash
+export PATH="/Users/hkarimkonda/.cargo/bin:$PATH"
+cargo --version
+rustc --version
+rustup show active-toolchain
+rustup component list --installed
+cargo fmt --all --check
+cargo clippy --locked --all-targets -- -D warnings
+python3 -m unittest discover -s scripts/tests -v
+cargo test --locked --all-targets
+RLSE_GPU_DEVICE=metal RLSE_GPU_MODEL_DIR=models/Qwen3-0.6B cargo test --locked --features metal --test test_gpu_inference --test test_pretrained_quality -- --ignored --nocapture
+```
+
+Formatting, CPU Clippy, and all **6 Python regressions passed**. The first CPU
+suite attempt encountered sandbox-denied localhost bindings in three process
+shutdown tests. Rerunning `/Users/hkarimkonda/.cargo/bin/cargo test --locked
+--all-targets` with host access passed: **75 passed, zero failed, two opt-in tests
+ignored**. These are CPU fixtures/default-feature checks, not GPU evidence.
+
+The explicit Metal test built successfully, then failed its local-weight
+prerequisite: `local pretrained weights are required` (zero passed, one failed,
+exit 101). Cargo stopped after `test_gpu_inference`; the independent reference
+test did not execute. No actual execution device was initialized, no model
+artifact loaded, and no inference sampling ran. Intended model/revision and
+sampling remain those recorded in the harness implementation entry below.
+`models/Qwen3-0.6B` is absent; `nvcc` and `nvidia-smi` are also unavailable.
+**Actual GPU inference verification remains pending**, including CUDA execution.
+
+## Validation harness implementation: 2026-10-21
+
+Added a Python standard-library harness for deterministic source transport,
+manifest verification, pinned Qwen3 artifact downloads, explicit CUDA/Metal test
+execution, and evidence export. The Colab notebook now calls repository scripts
+instead of embedding source, a stale archive, and generated Rust tests. Python
+regressions also run in the Linux CI job; hosted execution is not recorded.
+See [usage and limits](colab_cuda_kernels/validation_workflow.md).
+
+Commands run in this workspace:
+
+```bash
+python3 -m unittest discover -s scripts/tests -v
+python3 scripts/gpu_validation.py run --device cuda --output /tmp/rlse-cuda-validation-20261021
+python3 scripts/gpu_validation.py run --device metal --output /tmp/rlse-metal-validation-20261021
+cargo test --locked --all-targets
+RLSE_GPU_DEVICE=metal RLSE_GPU_MODEL_DIR=models/Qwen3-0.6B cargo test --locked --features metal --test test_gpu_inference --test test_pretrained_quality -- --ignored --nocapture
+python3 scripts/gpu_validation.py pack --output /tmp/rlse-source-20261021.tar.gz
+python3 scripts/gpu_validation.py unpack --archive /tmp/rlse-source-20261021.tar.gz --sha256 <sidecar_archive_sha256> --destination /tmp/rlse-source-20261021
+python3 scripts/gpu_validation.py pack --output /tmp/rlse-source-repeat-20261021.tar.gz
+git diff --check
+```
+
+Observed Python result: **6 passed** on Python 3.9.6. Regressions cover modified
+and untracked source inclusion, deterministic archives, excluded credentials and
+weights, source tampering, extra source, symlinks, archive traversal/hash rejection,
+model hash mismatch, blocked evidence export, and rejection of zero-test/CPU-only
+GPU claims. These tests use temporary synthetic artifacts; they do not perform
+pretrained inference or count as GPU evidence. Notebook code cells compile as
+Python and have no stored outputs. Actual-tree archive extraction/verification
+and repeated archive SHA-256 comparison passed; see the local archive sidecars
+for exact file hashes, base commit, and dirty state. Whitespace checks passed.
+
+Both explicit-device harness runs returned **blocked** (exit 1), exported logs,
+and recorded `actual_device: null`. This workspace has no `cargo`/`rustc`, `nvcc`,
+`nvidia-smi`, or local `models/Qwen3-0.6B` directory. Direct CPU and Metal Cargo
+commands returned exit 127 (`cargo: command not found`). No pretrained artifact
+was loaded and no inference sampling ran. Intended model: `Qwen/Qwen3-0.6B`,
+revision `c1899de289a04d12100db370d81485cdf75e47ca`; exact expected hashes remain
+in the independent reference fixture. Intended sampling: temperature 0, top-p 1,
+with the integration/reference token limits listed in the workflow. No actual
+execution device was established.
+
+**Rust CPU regressions and actual GPU inference verification remain pending for
+this change.** Downloaded/notebook CUDA execution, additional model manifests,
+numeric comparisons, and performance samples are also pending. The historical
+Metal results below validate earlier changes, not this new harness. No scaling
+or optimized-kernel acceptance claim is made.
+
 ## Root README refresh verification: 2026-10-20
 
 Documentation-only change: aligned the root README with all 21 CLI settings,

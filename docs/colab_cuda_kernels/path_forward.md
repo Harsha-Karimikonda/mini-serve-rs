@@ -18,6 +18,16 @@ The initial serving scope is single-GPU inference. Quantization and distributed 
 
 ## 1. Repeatable notebook validation
 
+**2026-10-21 implementation:** Source packaging, hash verification, pinned
+Qwen3-0.6B downloads, command logging, structured results, and evidence export now
+live in `scripts/gpu_validation.py`; the notebook calls that script. See
+[workflow and limitations](validation_workflow.md). CPU Rust checks and both explicit pretrained Metal gates subsequently passed
+after installing Rust and downloading pinned weights. See the
+[pretrained Metal recheck](../gpu_validation.md#pinned-weights-and-pretrained-metal-recheck-2026-10-21).
+Full harness execution and pretrained CUDA verification remain pending.
+Additional model manifests, numerical comparisons, and benchmark evidence remain
+subsequent work; the checklist below describes the full intended workflow.
+
 - Make `test_colab.ipynb` a thin interface over repository scripts. Remove embedded source copies and ad hoc generated Rust tests.
 - Package the exact current source tree, including intended uncommitted and untracked source files, with a manifest and archive hash. Exclude weights, credentials, build outputs, and `.git`; record the base commit and dirty state.
 - Pin each model revision and verify artifact hashes. Keep the existing Qwen3-0.6B identity and create equivalent manifests and independent reference fixtures for Qwen2.5-0.5B-Instruct and Qwen3-8B.

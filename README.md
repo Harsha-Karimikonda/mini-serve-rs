@@ -144,6 +144,8 @@ outputs, authentication, client quotas, draining, cancellation, memory-budget
 rejection/recovery, and fail-closed routing after an injected execution error
 following real GPU forwards. On a CUDA host, `make cuda-check` explicitly selects
 CUDA for the same integration gate; CUDA pretrained results remain unverified.
+The Metal target also runs [pretrained numeric regressions](docs/pretrained_numerics.md)
+against CPU/F32 logits, including batched decode and restored prefixes.
 For the independent pretrained output reference check on Metal:
 
 ```bash
@@ -247,7 +249,7 @@ Client / curl / Browser
 - [x] Candle Safetensors multi-shard model loader & native Metal acceleration
 - [x] API-key authentication and per-client rate/concurrency limits
 - [x] Tensor-memory reservations, backend quarantine, and worker draining
-- [x] Focused pretrained Metal inference and independent output regressions
+- [x] Focused pretrained Metal inference, independent output references, and numeric regressions
 - [x] Standalone Colab CUDA kernel prototypes and remote workflow
 - [ ] End-to-end pretrained CUDA inference verification
 - [ ] Tensor-backed physical paging and custom PagedAttention integration

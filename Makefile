@@ -1,7 +1,7 @@
 CARGO ?= cargo
 FEATURES ?= metal
 
-.PHONY: all build run test bench lint fmt clean gpu-check cuda-check
+.PHONY: all build run test bench lint fmt clean gpu-check cuda-check colab-sync colab-clear
 
 all: build
 
@@ -35,8 +35,16 @@ clean:
 
 # Explicit pretrained Metal inference; requires local Qwen3-0.6B weights.
 gpu-check:
-	RLSE_GPU_DEVICE=metal $(CARGO) test --locked --features metal --test test_gpu_inference -- --ignored --nocapture
+	RLSE_GPU_DEVICE=metal $(CARGO) test --locked --features metal --test test_gpu_inference --test test_pretrained_numerics -- --ignored --nocapture
 
 # Run inside a CUDA host (e.g. Colab), with local Qwen3 pretrained weights.
 cuda-check:
-	RLSE_GPU_DEVICE=cuda $(CARGO) test --locked --features cuda --test test_gpu_inference -- --ignored --nocapture
+	RLSE_GPU_DEVICE=cuda $(CARGO) test --locked --features cuda --test test_gpu_inference --test test_pretrained_quality --test test_pretrained_numerics -- --ignored --nocapture
+
+# Pack current source tree and embed into test_colab.ipynb for zero-popup VS Code -> Colab execution.
+colab-sync:
+	python3 scripts/gpu_validation.py pack --output /tmp/rlse-source.tar.gz --embed-notebook
+
+# Clear embedded archive payload from test_colab.ipynb before committing.
+colab-clear:
+	python3 scripts/gpu_validation.py clear-notebook

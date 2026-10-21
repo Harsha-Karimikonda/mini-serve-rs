@@ -96,24 +96,31 @@ Cancellation is checked between forward steps. Its latency depends on the durati
 
 ## 5. Implementation Status & Active Roadmap
 
-**2026-10-20 update:** API-key authentication is implemented and verified on
-CPU and actual Apple M4 Metal inference with pinned Qwen3-0.6B weights.
-Chat formatting/model identity also pass their focused Metal gate. Dedicated
-worker draining, cleanup, and HTTP responsiveness pass on Metal; process-signal
-integration remains open. Default/Metal-feature suites each pass 62 tests.
-See [authentication](api_authentication.md), [worker lifecycle](worker_lifecycle.md),
-[chat correctness](chat_correctness.md), and [current GPU evidence](gpu_validation.md#verified-current-working-tree-2026-10-20).
-Per-client rate/concurrency limits are the next unimplemented serving priority.
-Earlier dated evidence below retains its historical scope; no validating commit
-or hosted CI result is recorded.
+**2026-10-21 update:** P0 fixes and P1 serving features are implemented,
+including authentication, per-client quotas, execution telemetry, dedicated
+workers, and bounded shutdown. CPU process-signal tests and real Metal HTTP
+Ctrl-C draining have passed. The SSE benchmark parser is repaired. Pinned
+Qwen3-0.6B has focused independent generation references and pretrained Metal
+numeric comparisons. The latest CPU suite passes **80 tests** with two opt-in
+ignores; the separately invoked numeric Metal gate passes all **32 logit
+comparisons**. See [client quotas](client_limits.md), [worker lifecycle](worker_lifecycle.md),
+[GPU integration/reference evidence](gpu_validation.md), and
+[numeric results and exact commands](pretrained_numerics.md).
+
+Remaining work includes hosted CI on committed changes, broader model/quality
+and load evaluation, current performance measurements, guide corrections,
+physical tensor paging, and deployment expansion. CUDA work remains separate.
+Checked items below describe their verified scope; adjacent open items retain
+unfinished acceptance criteria. Earlier dated evidence is historical; no
+validating commit or hosted CI result is recorded.
 
 See the [production blocker investigation record](production_reproductions.md) for historical 2026-10-16 measurements and retained regression checks; the manual latency and contention probes have since been removed. Those checks reproduced HTTP-runtime blocking, generic chat formatting, and backend lock contention; the tested working tree passed the focused stop-handling and tensor-reservation checks. These results do not establish driver-level memory safety or multi-thread production-server latency.
 
 | Capability | Control-Plane Layer ([`src/cache/`](../src/cache/)) | Tensor Execution Layer ([`src/backends/`](../src/backends/)) |
 | :--- | :--- | :--- |
 | **KV-Cache Block Management** | **Implemented**: Logical block IDs, admission accounting, and fragmentation telemetry via `/api/status`. These counters do not enforce actual tensor-memory usage; a separate [byte reservation budget](tensor_memory.md) covers active KV, prefix storage, and estimated execution memory. | **Roadmap**: Tensor memory currently resides in per-sequence buffers (`candle_nn::kv_cache::KvCache`) sized to each request’s token limit. Direct non-contiguous PagedAttention kernels remain future work. |
-| **Prefix Caching** | **Implemented**: Chained SHA-256 chunk hashing, LRU eviction (512 entries), hit/miss counters, and telemetry. The entry limit is not a tensor-byte budget. | **Implemented; CPU regression coverage**: KV snapshots and optional logits can bypass prefill. Exact matches without saved logits replay the final token from the preceding KV state. Pretrained-model and GPU comparisons remain unverified. |
-| **Continuous Batching** | **Implemented**: Dynamic admission, bounded client channels with reserved terminal capacity, cancellation, and finished-sequence eviction. Full token channels terminate with an explicit error. | **Implemented; CPU regression coverage**: Batched decode projections and grouped-query attention. Request state survives interleaved workers; pretrained-model correctness and published performance require further validation. |
+| **Prefix Caching** | **Implemented**: Chained SHA-256 chunk hashing, LRU eviction (512 entries), hit/miss counters, and telemetry. The entry limit is not a tensor-byte budget. | **Implemented; CPU and focused pretrained Metal coverage**: KV snapshots and optional logits can bypass prefill. Exact matches without saved logits replay the final token from the preceding KV state. Cached/uncached greedy output and numeric prefix-restoration comparisons pass on pretrained Metal; see [numeric scope](pretrained_numerics.md). |
+| **Continuous Batching** | **Implemented**: Dynamic admission, bounded client channels with reserved terminal capacity, cancellation, and finished-sequence eviction. Full token channels terminate with an explicit error. | **Implemented; CPU and focused pretrained Metal coverage**: Batched decode projections and grouped-query attention. Request state survives interleaved workers; mixed-length batched logits match individual execution within documented tolerances. Published performance still needs current measurements. |
 
 ### 5.1 Review and Verification Baseline
 
@@ -129,18 +136,18 @@ This plan extends the existing roadmap across the serving stack. The following i
 
 The original findings came from source inspection. Subsequent CPU regressions cover the completed fixes; open items still need their own acceptance evidence. Pretrained-model and device validation remain separate from CPU fixture coverage.
 
-#### Current Maturity Assessment (2026-10-16, working tree)
+#### Current Maturity Assessment (2026-10-21, working tree)
 
-These ratings describe demonstrated coverage and remaining limitations, not production-readiness guarantees. The latest default and Metal-feature suites execute 49 tests, with five and six explicit model/manual ignores respectively. A separately invoked pretrained Metal gate verifies the focused behaviors recorded in [GPU verification](gpu_validation.md); it is not broad production-readiness or output-quality validation.
+These ratings describe demonstrated coverage and remaining limitations, not production-readiness guarantees. The latest CPU suite executes 80 tests, with two explicit ignores. Separately invoked pretrained Metal gates verify the focused behaviors recorded in [GPU verification](gpu_validation.md) and [numeric validation](pretrained_numerics.md); it is not broad production-readiness or output-quality validation.
 
 | Area | Maturity | Assessment |
 | :--- | :--- | :--- |
-| **Control plane & continuous batching** | **Medium–High** | Admission, cancellation, worker-state isolation, and reserved terminal delivery have regression coverage. Quarantined-backend routing is implemented. Worker supervision and bounded draining are implemented with CPU and focused Metal checks; process-signal/deadline integration remains open. Channel saturation terminates the slow request explicitly; it does not pause batch progress. |
+| **Control plane & continuous batching** | **Medium–High** | Admission, cancellation, worker-state isolation, and reserved terminal delivery have regression coverage. Quarantined-backend routing is implemented. Worker supervision and bounded draining have CPU and focused Metal checks. CPU process-signal/deadline tests and real Metal HTTP Ctrl-C draining pass; forced GPU hangs/deadline expiry remain unverified. Channel saturation terminates the slow request explicitly; it does not pause batch progress. |
 | **API protocol & streaming** | **Medium** | JSON/SSE completion and explicit termination/error behavior are tested. Model identity and artifact-defined chat templates have CPU/reference and focused pretrained Metal coverage as of 2026-10-20. |
-| **Inference & device kernels** | **Medium** | CPU fixtures cover grouped-query attention, batched decode, prefix restoration, and interleaved workers. Pretrained Metal cached/uncached greedy output and two-worker comparisons now pass the focused GPU gate. The shared backend mutex still serializes workers; dedicated inference threads now isolate synchronous forwards from the HTTP runtime. Numeric GPU logit comparisons and broader device/load coverage remain open. |
+| **Inference & device kernels** | **Medium** | CPU fixtures cover grouped-query attention, batched decode, prefix restoration, and interleaved workers. Pretrained Metal cached/uncached greedy output and two-worker comparisons now pass the focused GPU gate. The shared backend mutex still serializes workers; dedicated inference threads now isolate synchronous forwards from the HTTP runtime. Four-prompt CPU/F32 versus Metal/F16 logit, restored-prefix, and mixed-length batched decode comparisons pass; broader model/device/load coverage remains open. |
 | **Memory & KV cache management** | **Low for production memory control** | Logical block accounting coexists with real contiguous KV tensors and cached prefix activations. Physical paging is absent. Tensor-memory reservations, prefix eviction, cancellation release, and admission rejection are verified by CPU regressions and focused pretrained Metal inference. Device allocator measurements, forced OOM/recovery, and production load bounds remain open. |
-| **Text generation & output quality** | **Low–Medium** | Prefix reuse and stop matching across tokens have CPU and focused pretrained Metal checks. Artifact-defined chat formatting has CPU/reference and focused pretrained Metal coverage. Pretrained output quality requires broader evaluation beyond these targeted checks. |
-| **Production operations & security** | **Low** | CI and pre-commit checks exist; hosted CI execution is not yet recorded. API-key authentication, worker supervision, and bounded draining are implemented; per-client quotas and process-signal integration remain open. Existing queue limits provide overload protection, not per-client rate limiting. |
+| **Text generation & output quality** | **Low–Medium** | Prefix reuse and stop matching across tokens have CPU and focused pretrained Metal checks. Artifact-defined chat formatting has CPU/reference and focused pretrained Metal coverage. Four pinned Qwen3 cases match independent Transformers tokens/text for instruction following, roles, Spanish, and stops. Broader model/quality evaluation remains open. |
+| **Production operations & security** | **Low** | CI and pre-commit checks exist; hosted CI execution is not yet recorded. API-key authentication, bounded per-client quotas, worker supervision, and bounded draining are implemented and tested. CPU process-signal/deadline tests and Metal HTTP draining pass. Execution/prefix counters and readiness have exact CPU checks and focused Metal evidence. Driver hangs and production load remain unverified. |
 
 Returned Candle execution errors now quarantine the shared backend and trigger explicit request cleanup; see the [failure policy](device_failures.md). Reservation pressure is recoverable. This does not establish proactive GPU-memory protection or in-process device recovery after OOM.
 
@@ -237,11 +244,11 @@ gate now recorded in [AGENTS.md](../AGENTS.md).
   Metal inference. See [current GPU evidence](gpu_validation.md#verified-current-working-tree-2026-10-20).
   This does not establish broad pretrained generation quality or CUDA correctness.
 
-- [ ] **Separate inference execution from HTTP scheduling and supervise workers.** The historical implementation performed synchronous computation under a shared mutex inside an HTTP-runtime async task. Use a dedicated inference execution path with bounded communication and explicit cancellation. Retain worker handles, stop admission during shutdown, support bounded draining, and surface worker failures to routing and readiness checks.
+- [x] **Separate inference execution from HTTP scheduling and supervise workers.** The historical implementation performed synchronous computation under a shared mutex inside an HTTP-runtime async task. Use a dedicated inference execution path with bounded communication and explicit cancellation. Retain worker handles, stop admission during shutdown, support bounded draining, and surface worker failures to routing and readiness checks.
 
   **Acceptance:** A delayed forward pass does not prevent health/status requests from being serviced within a defined test bound. Worker failure removes that worker from routing; a saturated worker does not cause rejection when another eligible worker has capacity. Shutdown completes within its configured deadline and leaves no active allocations or worker tasks.
 
-  **Implementation evidence (2026-10-20):** The batching loop now runs on a dedicated thread/runtime. Supervisor handles join workers; forward panics fail active/queued streams and remove routing eligibility. Admission retries available workers after queue saturation. Ctrl-C stops admission, drains until the configured deadline, then enforces a process exit bound. Four CPU regressions cover blocking-forward HTTP responsiveness, panic cleanup, queue routing, and draining. Default/Metal suites and Clippy pass; the explicit pretrained Metal gate fails its missing-weights prerequisite. Focused GPU lifecycle verification subsequently passed; process-signal integration remains pending. See [commands, results, and limitations](worker_lifecycle.md).
+  **Implementation evidence (2026-10-20):** The batching loop now runs on a dedicated thread/runtime. Supervisor handles join workers; forward panics fail active/queued streams and remove routing eligibility. Admission retries available workers after queue saturation. Ctrl-C stops admission, drains until the configured deadline, then enforces a process exit bound. Four CPU regressions cover blocking-forward HTTP responsiveness, panic cleanup, queue routing, and draining. Default/Metal suites and Clippy pass; the explicit pretrained Metal gate fails its missing-weights prerequisite. Focused GPU lifecycle verification subsequently passed. CPU process-signal/deadline regressions and real Metal HTTP Ctrl-C draining also passed; forced GPU hangs/deadline expiry remain unverified. See [commands, results, and limitations](worker_lifecycle.md).
 
 - [x] **Authenticate protected API routes.** Add configurable API-key verification for inference and other explicitly protected routes, and document any public liveness endpoint. Keep credentials out of request logs, error payloads, and the dashboard. Define how local development and authenticated deployments are configured.
 
@@ -258,15 +265,27 @@ gate now recorded in [AGENTS.md](../AGENTS.md).
   checks cleanup. Default/Metal suites each pass 62 tests; formatting and both
   Clippy configurations pass. See [configuration and limitations](api_authentication.md)
   and [GPU artifacts/commands/results](gpu_validation.md#verified-current-working-tree-2026-10-20).
-  This is one shared key; per-client identity and quotas remain below.
+  Per-client identity and quotas are implemented below; distinct configured keys identify independent clients.
 
-- [ ] **Add per-client request and concurrency limits.** Keep existing queue/capacity rejection as global overload protection. Add bounded request-rate and concurrent-generation quotas per authenticated client, with a documented identity policy when authentication is disabled. Release concurrency permits on completion, error, cancellation, and shutdown.
+- [x] **Add per-client request and concurrency limits.** Keep existing queue/capacity rejection as global overload protection. Add bounded request-rate and concurrent-generation quotas per authenticated client, with a documented identity policy when authentication is disabled. Release concurrency permits on completion, error, cancellation, and shutdown.
 
   **Acceptance:** A client exceeding its quota receives HTTP 429 with appropriate retry information while another eligible client can continue. Concurrent requests cannot bypass quotas. Disconnects and failed requests do not leak permits, and client-limit bookkeeping has a bounded lifetime and size.
 
-- [ ] **Make telemetry describe actual work.** Count prefix hits and saved tokens once, when reuse occurs, rather than at both scheduler lookup and backend lookup. Report real worker readiness. Measure generated tokens consistently for streaming and JSON responses, and expose queue delay, time to first token, errors, cancellations, and memory accounting.
+  **Current evidence:** [Client quota policy and regressions](client_limits.md)
+  cover bounded client records, atomic acquisition, HTTP 429/Retry-After,
+  independent clients, and permit cleanup. The [pretrained Metal gate](gpu_validation.md#pinned-weights-and-pretrained-metal-recheck-2026-10-21)
+  passed quota isolation, rejection/recovery, and disconnect cleanup.
+
+- [x] **Make telemetry describe actual work.** Count prefix hits and saved tokens once, when reuse occurs, rather than at both scheduler lookup and backend lookup. Report real worker readiness. Measure generated tokens consistently for streaming and JSON responses, and expose queue delay, time to first token, errors, cancellations, and memory accounting.
 
   **Acceptance:** Deterministic scenarios produce exact expected counters. Metadata-only prefix matches do not claim skipped prefill work. Equivalent JSON/SSE requests agree on usage, and failed workers cannot appear healthy.
+
+  **Current evidence:** `tests/test_execution_telemetry.rs` asserts exact
+  JSON/SSE generated-token and outcome counters, queue-delay/TTFT counts, and
+  unhealthy-worker reporting. CPU prefix regressions count only actual reuse;
+  metadata-only lookup does not claim saved prefill. The [Metal integration
+  record](gpu_validation.md#pre-commit-verification-2026-10-20) verifies prefix
+  counters and terminal usage after real inference and warm/cold HTTP runs.
 
 ### 5.5 P1: Tests, Benchmarks, and Documentation
 
@@ -283,17 +302,48 @@ gate now recorded in [AGENTS.md](../AGENTS.md).
 
   **Acceptance:** A clean checkout passes the required jobs. Preserve the added tests that actually fill all 64 token slots and admit work while another request is decoding. Real-model jobs must fail when required weights are missing rather than report a skipped body as a pass. Record actual device selection; compiling with Metal enabled alone is not a GPU correctness check.
 
-- [ ] **Evaluate pretrained generation quality separately from protocol correctness.** Add a small reproducible prompt set for supported models covering instruction following, role handling, stop behavior, and multilingual output. Compare against the same model revision and sampling settings in a reference implementation. Extend the existing Metal smoke evidence with cached/uncached and multiworker comparisons on actual hardware.
+- [x] **Establish focused Qwen3 pretrained generation and numeric regressions.** Add a small reproducible prompt set for pinned Qwen3-0.6B covering instruction following, role handling, stop behavior, and multilingual output. Compare against the same model revision and sampling settings in a reference implementation. Extend the existing Metal smoke evidence with cached/uncached and multiworker comparisons on actual hardware.
 
   **Acceptance:** Record model/tokenizer revisions, chat template, sampling parameters, device, expected behaviors, and reference results. Use deterministic token/logit comparisons where appropriate and explain numerical tolerances. A single factual completion or passing mock tests must not be reported as broad output-quality validation.
 
-- [ ] **Repair and qualify the benchmark harness.** In [`examples/bench.rs`](../examples/bench.rs), buffer incomplete SSE frames and UTF-8 across network chunks. Require successful HTTP status, recognize stream errors, and require terminal completion. Exclude the empty finish chunk from token counts; use authoritative usage where available. Separate generation throughput from end-to-end latency and label the measurement method.
+  **Numeric regression addition (2026-10-21):** The existing four-case independent
+  generation fixture now also drives pretrained Metal/F16 versus Candle CPU/F32
+  full-vocabulary logit comparisons, restored-prefix checks, and mixed-length
+  batched decode comparisons. See [numeric validation](pretrained_numerics.md)
+  for commands, tolerances, artifact identity, results, and limits. Broader
+  model/quality coverage remains open; the numeric CPU reference uses the same
+  model implementation.
 
-  **Acceptance:** Parser tests split valid SSE at arbitrary byte boundaries and handle errors and premature EOF. Counts agree with server usage, including tokens that decode to empty text. Publish repeated measurements with warmup, model revision, hardware, build flags, concurrency, and separate cold/warm prefix-cache runs. Revalidate existing performance claims before treating them as the current baseline.
+- [ ] **Broaden pretrained model and quality coverage.** Extend the focused
+  Qwen3 reference set to Qwen2.5 and more prompts, languages, longer contexts,
+  and sampling settings. Record independent references and device-specific
+  tolerances. The completed four-case regression does not close this work.
+
+- [x] **Repair and exercise the benchmark harness.** In [`examples/bench.rs`](../examples/bench.rs), buffer incomplete SSE frames and UTF-8 across network chunks. Require successful HTTP status, recognize stream errors, and require terminal completion. Exclude the empty finish chunk from token counts; use authoritative usage where available. Separate generation throughput from end-to-end latency and label the measurement method.
+
+  **Acceptance:** Parser tests split valid SSE at arbitrary byte boundaries and handle errors and premature EOF. Counts agree with server usage, including tokens that decode to empty text. Exercise repeated warm/cold runs with warmup and explicit model/device/sampling identity.
+
+  **Current evidence:** `src/sse.rs` tests arbitrary byte splits, UTF-8,
+  errors, premature EOF, terminal chunks, and authoritative usage. The
+  [real Metal HTTP record](gpu_validation.md#pre-commit-verification-2026-10-20)
+  passed three rounds each of warm/cold benchmarks, one warmup per mode,
+  concurrency two, and 12-token limits. These correctness runs do not
+  revalidate historical throughput claims.
+
+- [ ] **Publish current performance measurements and qualify historical claims.**
+  Use the repaired harness to publish repeated measurements with model revision,
+  hardware, build flags, warmup, concurrency, and separate cold/warm prefix runs.
+  Distinguish client-observed decode rate from end-to-end latency. Revalidate
+  historical comparisons before treating them as the current baseline.
 
 - [ ] **Align existing guides with the implementation.** Update the root README's test count and explain model-test prerequisites. Correct claims about physical paging, deterministic memory bounds, direct prefix-block sharing, worker health filtering, fragmentation measurement, and cancellation latency. Distinguish implemented behavior from intended behavior and historical measurements.
 
   **Acceptance:** Cross-check the [architecture](architecture.md), [API reference](api_reference.md), [backend guide](backends_and_models.md), and [benchmark guide](benchmarks_and_performance.md) against code and reproducible checks. Link roadmap statements to this plan rather than maintaining competing completion lists.
+
+  **Still open:** The root README reflects the current prerequisites and
+  limits, but the architecture guide still calls logical cache blocks physical,
+  and the benchmark guide retains outdated methodology and unqualified
+  historical claims. Those guide corrections are not yet complete.
 
 ### 5.6 P2: Physical Paging and Deployment Expansion
 
@@ -308,5 +358,16 @@ gate now recorded in [AGENTS.md](../AGENTS.md).
 ### 5.7 Completion Evidence
 
 Close each checkbox only when the change, regression coverage, and relevant documentation land together. Record the validating commit, commands, model/hardware prerequisites, and results in the change description. Keep unresolved or untested device paths open; a passing mock suite alone does not establish real-model correctness or production readiness.
+
+**Roadmap reconciliation (2026-10-21):** Updated the current summary, capability
+table, maturity assessment, and completion checkboxes against source, regression
+tests, and the linked inference records. Split focused Qwen3 verification and
+benchmark repairs from broader evaluation and performance publication. This is
+a documentation-only follow-up to the CPU and actual Metal runs recorded in
+[numeric verification](pretrained_numerics.md); it introduces no execution
+changes or new inference claims. Local Markdown link targets were checked for
+this guide and the root README, and `git diff --check` passed. Historical dated
+records retain their original results. Hosted CI and a validating commit remain
+unrecorded.
 
 
