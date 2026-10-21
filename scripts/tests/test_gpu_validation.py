@@ -108,6 +108,32 @@ class ValidationTests(unittest.TestCase):
             self.assertIn("missing actual cuda", result["reason"])
             self.assertIsNone(result["actual_device"])
 
+    def test_numeric_gpu_gate_is_opt_in(self):
+        manifest = gpu.snapshot(self.root)
+        for include_numerics in (False, True):
+            def fake_run(argv, **kwargs):
+                kwargs["stdout"].write(
+                    "ACTUAL_DEVICE=Cuda(fixture);\n"
+                    "test result: ok. 1 passed; 0 failed; 0 ignored;\n"
+                )
+                return subprocess.CompletedProcess(argv, 0)
+
+            output = self.base / ("numeric-gate-" + str(include_numerics))
+            with patch.object(gpu, "snapshot", return_value=manifest), \
+                 patch.object(gpu, "verify_model"), \
+                 patch.object(gpu.shutil, "which", return_value="/fake/tool"), \
+                 patch.object(gpu.subprocess, "run", side_effect=fake_run):
+                self.assertEqual(gpu.run_validation(
+                    self.root, "cuda", self.root / "models", output,
+                    include_numerics=include_numerics), 0)
+            result = json.loads((output / "results.json").read_text())
+            gates = [entry["argv"][entry["argv"].index("--test") + 1]
+                     for entry in result["commands"] if "--test" in entry["argv"]]
+            expected = ["test_gpu_inference", "test_pretrained_quality"]
+            if include_numerics:
+                expected.append("test_pretrained_numerics")
+            self.assertEqual(gates, expected)
+
     def test_model_hash_mismatch_is_rejected(self):
         self.write("models/model.safetensors", "wrong artifact")
         with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):

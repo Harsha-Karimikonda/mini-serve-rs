@@ -10,6 +10,11 @@ import subprocess
 import sys
 import tempfile
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    tqdm = None
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -68,6 +73,7 @@ def run_kernel_suite(cu_path: Path, output_json: Path = None) -> dict:
 
     with tempfile.TemporaryDirectory(prefix="rlse-kernels-") as tmp:
         so_path = Path(tmp) / "libmini_serve_kernels.so"
+        print(f"Compiling {cu_path.name} with nvcc for {gpu_name} ({arch})...", flush=True)
         cmd = [
             "nvcc",
             "-O3",
@@ -121,6 +127,7 @@ def run_kernel_suite(cu_path: Path, output_json: Path = None) -> dict:
             "f32": (torch.float32, 1e-5, 1e-4, lib.launch_rmsnorm_f32, lib.launch_paged_gqa_decode_tiled_f32),
             "f16": (torch.float16, 5e-3, 5e-3, lib.launch_rmsnorm_f16, lib.launch_paged_gqa_decode_tiled_f16),
         }
+        pbar = tqdm(total=36, desc="Validating CUDA kernels", dynamic_ncols=True) if tqdm else None
 
         # 2. Multi-row Fused RMSNorm across hidden_size (1024) and Q/K head_dim (128)
         for dtype_name, (dtype, atol, rtol, rms_fn, _) in tolerances.items():
@@ -148,6 +155,9 @@ def run_kernel_suite(cu_path: Path, output_json: Path = None) -> dict:
                     report["rmsnorm_cases"].append(
                         {"dtype": dtype_name, "rows": num_rows, "dim": hidden_size, "max_abs_err": max_abs}
                     )
+                    if pbar is not None:
+                        pbar.update(1)
+                        pbar.set_postfix_str(f"RMSNorm {dtype_name} {num_rows}x{hidden_size} err={max_abs:.2e}")
 
         # 3. Single-sequence boundary lengths & fragmented page tables
         num_heads, num_kv_heads, head_dim = 16, 8, 128
@@ -189,6 +199,9 @@ def run_kernel_suite(cu_path: Path, output_json: Path = None) -> dict:
                 report["paged_gqa_cases"].append(
                     {"dtype": dtype_name, "seq_len": seq_len, "max_abs_err": max_abs}
                 )
+                if pbar is not None:
+                    pbar.update(1)
+                    pbar.set_postfix_str(f"PagedGQA {dtype_name} len={seq_len} err={max_abs:.2e}")
 
             # 4. Ragged continuous batch with shared prefix page reuse (physical pages [7, 12] shared)
             ragged_lens = [1, 15, 16, 17, 31, 32, 33]
@@ -233,6 +246,11 @@ def run_kernel_suite(cu_path: Path, output_json: Path = None) -> dict:
             report["ragged_batch_cases"].append(
                 {"dtype": dtype_name, "seq_lens": ragged_lens, "shared_prefix_pages": [7, 12], "max_abs_err": max_abs}
             )
+            if pbar is not None:
+                pbar.update(1)
+                pbar.set_postfix_str(f"Ragged {dtype_name} err={max_abs:.2e}")
+        if pbar is not None:
+            pbar.close()
 
     report["status"] = "passed"
     if output_json:

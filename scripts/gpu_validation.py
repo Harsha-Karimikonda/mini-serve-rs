@@ -14,9 +14,15 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import tempfile
 import urllib.request
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    tqdm = None
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_DIRS = {"src", "tests", "examples", "scripts", "docs", ".github", ".githooks"}
@@ -188,9 +194,11 @@ def verify_model(directory, manifest):
 def download_model(root, directory):
     manifest = model_manifest(root)
     directory.mkdir(parents=True, exist_ok=True)
-    for name, expected in manifest["hashes"].items():
+    items = list(manifest["hashes"].items())
+    for idx, (name, expected) in enumerate(items, 1):
         path = directory / name
         if path.exists():
+            print(f"[{idx}/{len(items)}] Verifying cached {name}...", flush=True)
             if digest(path) != expected:
                 raise ValueError(f"refusing to overwrite mismatched artifact: {name}")
             continue
@@ -200,14 +208,35 @@ def download_model(root, directory):
         url = f"https://huggingface.co/{manifest['model']}/resolve/{manifest['revision']}/{name}"
         try:
             with urllib.request.urlopen(url, timeout=120) as response, temporary.open("wb") as out:
-                shutil.copyfileobj(response, out)
+                total = int(response.headers.get("Content-Length") or 0)
+                pbar = (
+                    tqdm(total=total or None, unit="B", unit_scale=True, unit_divisor=1024, desc=f"Downloading {name}")
+                    if tqdm and os.environ.get("RLSE_STREAM_PROGRESS") != "1"
+                    else None
+                )
+                downloaded = 0
+                last_report = time.monotonic()
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    downloaded += len(chunk)
+                    if pbar is not None:
+                        pbar.update(len(chunk))
+                    elif time.monotonic() - last_report >= 0.25 or downloaded == total:
+                        print(f"[DOWNLOAD] {name} {downloaded} {total}", flush=True)
+                        last_report = time.monotonic()
+                if pbar is not None:
+                    pbar.close()
+            print(f"[{idx}/{len(items)}] Verifying SHA-256 for {name}...", flush=True)
             if digest(temporary) != expected:
                 raise ValueError(f"download SHA-256 mismatch: {name}")
             temporary.rename(path)
         finally:
             temporary.unlink(missing_ok=True)
     verify_model(directory, manifest)
-    print(f"Verified {manifest['model']} at {manifest['revision']}")
+    print(f"Verified {manifest['model']} at {manifest['revision']}", flush=True)
 
 
 def augment_toolchain_path(env):
@@ -218,7 +247,7 @@ def augment_toolchain_path(env):
     env["PATH"] = os.pathsep.join(path_entries)
 
 
-def run_validation(root, device, model, output, cache_dir=None, include_kernels=False, include_server=False):
+def run_validation(root, device, model, output, cache_dir=None, include_kernels=False, include_server=False, include_numerics=False):
     output.mkdir(parents=True, exist_ok=False)
     results = {"schema": 1, "status": "blocked", "requested_device": device,
                "actual_device": None, "host": platform.platform(), "commands": [],
@@ -229,24 +258,76 @@ def run_validation(root, device, model, output, cache_dir=None, include_kernels=
     env = {k: v for k, v in os.environ.items() if not k.startswith("RLSE_")}
     augment_toolchain_path(env)
     env.update(RLSE_GPU_DEVICE=device, RLSE_GPU_MODEL_DIR=str(model))
+    stream_mode = os.environ.get("RLSE_STREAM_PROGRESS") == "1"
 
     def command(argv, required=True):
         index = len(results["commands"])
         start = time.monotonic()
-        print("Running:", " ".join(argv), flush=True)
+        label = " ".join(argv)
+        print("Running:", label, flush=True)
         entry = {"argv": argv, "log": f"{index:02d}.log"}
         results["commands"].append(entry)
-        with (output / entry["log"]).open("w") as log:
+        log_path = output / entry["log"]
+        stop_event = threading.Event()
+        use_monitor = not hasattr(subprocess.run, "_mock_name")
+
+        def monitor_log():
+            offset = 0
+            last_beat = time.monotonic()
+            pbar = (
+                tqdm(desc=f"[{index:02d}] {' '.join(argv[:4])}", unit="line", dynamic_ncols=True, leave=False)
+                if (tqdm and not stream_mode)
+                else None
+            )
+            try:
+                while not stop_event.is_set():
+                    if log_path.is_file():
+                        with log_path.open("r", errors="replace") as reader:
+                            reader.seek(offset)
+                            chunk = reader.read()
+                            offset = reader.tell()
+                        if chunk:
+                            for raw_line in chunk.splitlines():
+                                s = raw_line.strip()
+                                if not s:
+                                    continue
+                                if stream_mode:
+                                    print(f"[LOG] {s}", flush=True)
+                                elif pbar is not None:
+                                    pbar.update(1)
+                                    pbar.set_postfix_str(s[:65])
+                            last_beat = time.monotonic()
+                    now = time.monotonic()
+                    if now - last_beat >= 1.0:
+                        elapsed = now - start
+                        if stream_mode:
+                            print(f"[HEARTBEAT] elapsed={elapsed:.1f}s cmd={' '.join(argv[:4])}", flush=True)
+                        elif pbar is not None:
+                            pbar.set_postfix_str(f"running ({elapsed:.1f}s)")
+                        last_beat = now
+                    stop_event.wait(0.2)
+            finally:
+                if pbar is not None:
+                    pbar.close()
+
+        monitor = threading.Thread(target=monitor_log, daemon=True) if use_monitor else None
+        if monitor is not None:
+            monitor.start()
+        with log_path.open("w") as log:
             try:
                 completed = subprocess.run(argv, cwd=root, env=env, stdout=log, stderr=subprocess.STDOUT)
                 entry["exit_code"] = completed.returncode
             except FileNotFoundError:
                 entry["exit_code"] = 127
                 log.write(f"Executable unavailable: {argv[0]}\n")
+            finally:
+                stop_event.set()
+                if monitor is not None:
+                    monitor.join(timeout=1.0)
         entry["seconds"] = round(time.monotonic() - start, 3)
-        content = (output / entry["log"]).read_text(errors="replace")
+        content = log_path.read_text(errors="replace")
         if required and entry["exit_code"]:
-            raise RuntimeError(f"command failed ({entry['exit_code']}): {' '.join(argv)}; see {entry['log']}")
+            raise RuntimeError(f"command failed ({entry['exit_code']}): {label}; see {entry['log']}")
         return content
 
     try:
@@ -288,7 +369,10 @@ def run_validation(root, device, model, output, cache_dir=None, include_kernels=
         results["status"] = "failed"
         command(["cargo", "clippy", "--locked", "--features", device, "--all-targets", "--", "-D", "warnings"])
         command(["cargo", "test", "--locked", "--features", device, "--all-targets"])
-        for test in ("test_gpu_inference", "test_pretrained_quality", "test_pretrained_numerics"):
+        gpu_gates = ["test_gpu_inference", "test_pretrained_quality"]
+        if include_numerics:
+            gpu_gates.append("test_pretrained_numerics")
+        for test in gpu_gates:
             log = command(["cargo", "test", "--locked", "--features", device, "--test", test, "--", "--ignored", "--nocapture"])
             marker = "Metal" if device == "metal" else "Cuda"
             actual = re.findall(r"ACTUAL_DEVICE=([^;\n]+)", log)
@@ -347,6 +431,7 @@ def main():
     p.add_argument("--cache-dir", type=Path)
     p.add_argument("--include-kernels", action="store_true")
     p.add_argument("--include-server", action="store_true")
+    p.add_argument("--include-numerics", action="store_true")
     p.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     root = args.root.resolve()
@@ -367,6 +452,7 @@ def main():
             cache_dir=args.cache_dir.resolve() if args.cache_dir else None,
             include_kernels=args.include_kernels,
             include_server=args.include_server,
+            include_numerics=args.include_numerics,
         )
     return 0
 

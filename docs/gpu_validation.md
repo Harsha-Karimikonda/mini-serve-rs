@@ -4,6 +4,57 @@ Completed changes must include an actual GPU inference run, in addition to CPU
 regressions and feature builds. This project rule is recorded in [AGENTS.md](../AGENTS.md).
 If GPU access or weights are unavailable, GPU verification stays pending.
 
+## Live progress reporting commit verification: 2026-10-21
+
+Added optional `tqdm` download/command/kernel progress, streamed log messages
+and heartbeats, and notebook progress displays. Numeric GPU comparisons are now
+opt-in with `--include-numerics`. Cleared the generated embedded
+source archive before committing, following the notebook's instructions.
+
+```bash
+python3 scripts/gpu_validation.py clear-notebook
+python3 -m unittest discover -s scripts/tests -v
+RLSE_STREAM_PROGRESS=1 python3 scripts/gpu_validation.py download-model
+RLSE_STREAM_PROGRESS=1 python3 scripts/gpu_validation.py run --device metal --output /tmp/rlse-progress-commit-validation
+python3 scripts/validate_cuda_kernels.py --output /tmp/rlse-progress-cuda-kernels.json
+git diff --check
+```
+
+The harness ran with host GPU/localhost access and returned **passed**. CPU:
+**80 passed, two ignored**; Python: **7 passed**. Formatting, Metal Clippy,
+and the Metal-feature regression suite passed. All three explicit pretrained
+GPU gates passed (command durations: integration 42.249 s, independent generation
+5.442 s, numeric 141.042 s). Live `[LOG]` output and `[HEARTBEAT]` messages were
+observed during builds and pretrained inference. Numeric checks passed all 32
+comparisons, including restored prefixes and batched decode, with identical
+greedy decisions; all four independent token/text reference cases matched.
+
+Actual device: `Metal(MetalDevice(DeviceId(1)))`, Apple M4, 8 GPU cores.
+Model: local `models/Qwen3-0.6B`, `Qwen/Qwen3-0.6B`, revision
+`c1899de289a04d12100db370d81485cdf75e47ca`; all four pinned artifact hashes
+verified. Sampling: greedy, temperature 0, top-p 1; numeric GPU/F16 versus
+CPU/F32 uses three teacher-forced decode steps. Integration/reference limits
+remain those documented below. Evidence:
+`/private/tmp/rlse-progress-commit-validation.tar.gz`, SHA-256
+`769b2752eb33454bea3e0aecbb6e249b438680b7581210d66dbacb7f357695c6`.
+
+Additional local checks compiled all notebook code cells and asserted empty
+embedded payloads/outputs. A synthetic 27-byte download using mocked URL access
+emitted `[DOWNLOAD] model.safetensors 27 27` and preserved hash-verified bytes;
+the real cached-artifact command also passed. These download checks are not GPU
+evidence. CUDA validation exited 1 because `nvcc` is unavailable: CUDA execution
+and kernel progress displays remain **pending**. Colab widget rendering and
+real network-download progress were not exercised. No performance claim is made.
+
+The opt-in numeric flag and notebook stage-count adjustment arrived after the
+full harness run started; that run used the preceding version, which always
+included all three GPU gates. The inference implementation is unchanged.
+Final Python regressions reran with **8 passed**, including a repeatable mocked
+check requiring exactly the two default gates and all three when
+`include_numerics=True`. Mocked device markers are synthetic and provide no GPU
+evidence. Future full numeric runs must add `--include-numerics` to the command
+above. The complete harness was not rerun after this routing-only adjustment.
+
 ## Commit recheck: 2026-10-21
 
 Commands used to recheck the staged change set (run before staging):
