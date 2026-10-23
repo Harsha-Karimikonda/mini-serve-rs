@@ -88,3 +88,72 @@ benchmark performance, validate additional models, or prove driver OOM/hang
 recovery. CUDA acceptance and actual pretrained inference remain pending until
 an equipped host executes the harness successfully. See
 [the recorded local checks](../gpu_validation.md#validation-harness-implementation-2026-10-21).
+
+## A100 follow-up: numerical comparison (2026-10-23)
+
+The user-supplied Colab console output reports a successful baseline run on
+`NVIDIA A100-SXM4-40GB` (`sm_80`, driver `580.82.07`), with
+`ACTUAL_DEVICE=Cuda(CudaDevice(DeviceId(1)))`, pinned Qwen3-0.6B revision
+`c1899de289a04d12100db370d81485cdf75e47ca`, artifact verification,
+kernel status `passed`, server validation `true`, and overall status `passed`.
+This is console evidence; the complete baseline bundle has not been inspected.
+It excludes the opt-in pretrained numerical gate and makes no throughput claim.
+
+Added a final, separate notebook cell to run the existing numerical gate after a
+successful baseline, without changing inference code or acceptance tolerances:
+
+```bash
+RLSE_GPU_DEVICE=cuda RLSE_GPU_MODEL_DIR=/content/rlse-models/Qwen3-0.6B \
+CARGO_TARGET_DIR=<baseline-results.json-target_directory> \
+cargo test --locked --features cuda --test test_pretrained_numerics -- --ignored --nocapture
+```
+
+The command runs from the previously unpacked source root. The cell retains the
+baseline evidence (source manifest, model hashes, CPU checks, hardware discovery),
+streams and saves `numerics.log`, and records command, working directory, relevant
+environment, exit code, duration, and actual-device markers in a separate
+`results.json`. Its downloadable `/content/rlse-numerics-<uuid>.tar.gz` is produced
+before a test failure is raised. It requires one executed passing test and an
+actual CUDA marker. The baseline result is not overwritten.
+
+Comparison settings: CPU/F32 reference versus GPU/F16; greedy argmax decisions;
+three teacher-forced decode steps; prefill, restored prefixes, and single/batched
+decode. Existing bounds remain cross-device max absolute error 0.25 / RMS 0.04,
+and same-device execution-path max absolute error 0.125 / RMS 0.03, with finite
+logits and identical greedy decisions required.
+
+Local validation commands:
+
+```bash
+python3 -m unittest discover -s scripts/tests -v
+cargo test --locked --test test_pretrained_numerics
+# Additionally compile() every notebook code cell and run git diff --check.
+```
+
+Python regressions: 8 passed. CPU numerical regressions: 5 passed (0.05 s,
+following a 50.78 s build). All notebook code cells compile; `git diff --check`
+passed. **CUDA numerical
+verification and remote execution of the new cell remain pending**: this local
+host has no NVIDIA CUDA device, and pinned local model weights are absent.
+No Metal run or synthetic test is counted as CUDA evidence. Keep the existing
+Colab runtime connected and run only the new final cell; its CPU reference work
+may take minutes. Save the diagnostic bundle for diagnosis before kernel
+integration. For future full runs, enable `--include-numerics` in the main
+pipeline instead.
+
+## Repeatable `make colab-sync` (2026-10-23)
+
+The convenience target previously used the fixed `/tmp/rlse-source.tar.gz` path,
+so a second invocation failed with `FileExistsError` because the packer opens new
+archives exclusively. The target now creates a fresh directory with
+`mktemp -d /tmp/rlse-colab-sync.XXXXXX` and embeds its archive into the notebook.
+The printed output path identifies the archive and adjacent JSON sidecar. Prior
+archives are preserved, and the packer's overwrite protection is unchanged.
+
+Validation: two consecutive `make colab-sync` invocations succeeded using distinct
+directories. Python harness regressions (`python3 -m unittest discover -s
+scripts/tests -v`) passed all 8 tests; `git diff --check` passed. This is a source
+transport change with no inference or sampling changes. The earlier user-supplied
+A100 baseline console evidence is recorded above; GPU execution of this updated
+source bundle and the numerical follow-up remain **pending** on the connected
+Colab A100 with the pinned Qwen3-0.6B artifacts. This local host has no CUDA GPU.

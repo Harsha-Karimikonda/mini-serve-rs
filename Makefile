@@ -43,7 +43,8 @@ cuda-check:
 
 # Pack current source tree and embed into test_colab.ipynb for zero-popup VS Code -> Colab execution.
 colab-sync:
-	python3 scripts/gpu_validation.py pack --output /tmp/rlse-source.tar.gz --embed-notebook
+	@sync_dir=$$(mktemp -d /tmp/rlse-colab-sync.XXXXXX) && \
+		python3 scripts/gpu_validation.py pack --output "$$sync_dir/rlse-source.tar.gz" --embed-notebook
 
 # Clear embedded archive payload from test_colab.ipynb before committing.
 colab-clear:
