@@ -48,7 +48,7 @@ jobs:
       - name: Setup Python for GPU harness regressions
         uses: actions/setup-python@v5
         with:
-          python-version: '3.9'
+          python-version: '3.12'
 
       - name: Test GPU validation harness (no GPU required)
         run: python3 -m unittest discover -s scripts/tests -v
