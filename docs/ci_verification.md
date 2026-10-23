@@ -25,3 +25,19 @@ A successful macOS/Metal CI build or test suite does not establish real GPU
 inference with local pretrained weights. The GitHub Actions run for the repair
 must separately confirm Python 3.12 setup, the Python harness regressions,
 Rust CPU tests, and lint/Metal checks.
+
+Remote verification for repair commit `52e1502a7c862bdaa9ff0cca7b2f900119f9972a`:
+[run 39983641780](https://github.com/Harsha-Karimikonda/mini-serve-rs/actions/runs/39983641780)
+completed with all three jobs successful:
+
+- Code Quality & Linting: `cargo fmt --check` and
+  `cargo clippy --locked --all-targets -- -D warnings` passed.
+- Tests (Linux / CPU): Python 3.12 setup,
+  `python3 -m unittest discover -s scripts/tests -v`, and
+  `cargo test --locked --all-targets` passed.
+- Tests & Linting (macOS / Metal):
+  `cargo clippy --locked --features metal --all-targets -- -D warnings` and
+  `cargo test --locked --features metal` passed.
+
+These results confirm the CI setup repair and CPU regressions. Real pretrained
+GPU inference remains pending for the reasons above.
